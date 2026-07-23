@@ -1,0 +1,60 @@
+[package]
+name = "socd-kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["SOC-D Project"]
+description = "Sistema Operacional Cognitivo Distribuído — Kernel Core"
+
+[[bin]]
+name = "socd-kernel"
+path = "src/main.rs"
+
+[dependencies]
+# Bootloader 0.9.x — API estável com map_physical_memory
+bootloader = { version = "0.9.23", features = ["map_physical_memory"] }
+
+
+# Spinning mutex — no_std spinlock
+spinning_top = "0.3"
+
+# Linked list allocator — heap do kernel
+linked_list_allocator = "0.10"
+
+# Math library for no_std (sin, cos, sqrt)
+libm = "0.2"
+
+# Bitflags — flags de página
+bitflags = "1"
+
+# Lazy static — globais inicializadas em runtime
+lazy_static = { version = "1", features = ["spin_no_std"] }
+
+# x86_64 — abstrações de hardware
+x86_64 = "0.14"
+
+# UART 16550 — porta serial (debug)
+uart_16550 = "0.2"
+
+# PS/2 Keyboard
+pc-keyboard = "0.5"
+
+# PIC8259 — controlador de interrupções
+pic8259 = "0.10"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+
+[package.metadata.bootimage]
+test-args = [
+    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-serial", "stdio",
+    "-display", "none"
+]
+test-success-exit-code = 33
+test-timeout = 300
