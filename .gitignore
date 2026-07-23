@@ -1,2 +1,8 @@
+/target/
 target/
 *.bin
+*.iso
+*.img
+.DS_Store
+Thumbs.db
+*.log
