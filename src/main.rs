@@ -63,6 +63,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // ── 6: Memory / Heap ──────────────────────────────────────
     let phys_mem_offset = x86_64::VirtAddr::new(boot_info.physical_memory_offset);
+    memory::set_phys_mem_offset(phys_mem_offset.as_u64());
     let mut mapper = unsafe { memory::paging::init(phys_mem_offset) };
     let mut frame_allocator = unsafe {
         memory::frame_allocator::BootInfoFrameAllocator::init(&boot_info.memory_map)
@@ -144,7 +145,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // ── 19: Net stack ─────────────────────────────────────────
     net::init();
-    net::virtio::init();
+    // NOTA: net::virtio::init() removido — inicializava um driver
+    // virtio-net paralelo 100% simulado (nunca ligado a hardware
+    // real), que só confundia o boot com uma segunda mensagem
+    // "virtio-net inicializado" antes da Fase 7 (driver real, ver
+    // net::virtio_real) mais abaixo.
     net::ethernet::init();
     serial_println!("[OK] Stack de rede ativa");
 

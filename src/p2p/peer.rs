@@ -210,6 +210,11 @@ impl PeerTable {
             .max_by_key(|p| p.trust_score)
     }
 
+    /// Procura um peer pelo NodeId (para resolver destino no envio UDP real)
+    pub fn lookup(&self, node_id: &[u8; 32]) -> Option<PeerInfo> {
+        self.peers.get(node_id).cloned()
+    }
+
     /// Contagem de peers por estado
     pub fn counts(&self) -> (usize, usize) {
         let known = self.peers.len();
@@ -262,4 +267,10 @@ pub fn get_active_peers() -> Vec<PeerInfo> {
 /// Retorna os node_ids de todos os peers conhecidos (Fase 6.2)
 pub fn get_known_peers() -> Vec<[u8; 32]> {
     get_all_peers().into_iter().map(|p| p.node_id).collect()
+}
+
+/// Procura um peer pelo NodeId (usado pelo transporte UDP real para
+/// resolver o IP/porta de destino a partir de um node_id P2P)
+pub fn lookup(node_id: &[u8; 32]) -> Option<PeerInfo> {
+    PEER_TABLE.lock().lookup(node_id)
 }

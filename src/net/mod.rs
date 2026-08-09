@@ -94,6 +94,20 @@ impl Ipv4Addr {
     }
     pub fn is_multicast(&self)  -> bool { self.0[0] >= 224 && self.0[0] <= 239 }
     pub fn is_broadcast(&self)  -> bool { *self == Self::BROADCAST }
+
+    /// Faz parse de um endereço "a.b.c.d" (ex: vindo de PeerInfo::address).
+    /// Devolve None se a string não for um IPv4 válido.
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut octets = [0u8; 4];
+        let mut count = 0;
+        for part in s.split('.') {
+            if count >= 4 { return None; }
+            octets[count] = part.parse::<u8>().ok()?;
+            count += 1;
+        }
+        if count != 4 { return None; }
+        Some(Self(octets))
+    }
 }
 
 /// Endereço IPv6 (16 bytes)

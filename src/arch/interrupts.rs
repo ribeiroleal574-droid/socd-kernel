@@ -93,6 +93,12 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
         // ~60fps UI update
         crate::ui::shell::tick(tick);
     }
+    if tick % 20 == 0 {
+        // Sondagem da rede real (virtio-net) — mais frequente que os
+        // outros subsistemas porque pacotes UDP P2P recebidos ficam
+        // parados nos buffers RX até serem drenados.
+        crate::p2p::transport::poll_receive();
+    }
 
     // IMPORTANTE: o EOI tem de ser enviado ANTES de uma possível troca
     // de contexto. `preempt()` pode não "regressar" aqui durante vários

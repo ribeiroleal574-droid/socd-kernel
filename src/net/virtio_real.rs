@@ -178,48 +178,148 @@ impl VirtioRegs {
     fn mac_byte(&self, i: u16) -> u8 { unsafe { self.read_u8(0x14 + i) } }
 }
 
-// ─── Virtqueue Real ──────────────────────────────────────────
-// Estruturas para implementação futura com DMA real
+// ─── Virtqueue Real (legacy virtio 0.9) ───────────────────────
+//
+// Layout legacy (um único bloco físico contíguo por queue):
+//   [ Descriptor Table (16 bytes * qsz) ]
+//   [ Available Ring (6 + 2*qsz bytes) ]
+//   [ padding até à página seguinte ]
+//   [ Used Ring (6 + 8*qsz bytes), alinhado a 4096 ]
+//
+// O offset físico é escrito em QUEUE_ADDR como (phys_addr >> 12) —
+// por isso o bloco tem de estar alinhado a página E fisicamente
+// contíguo (o device não sabe nada de paginação virtual do kernel).
+//
+// Para garantir contiguidade física sem um alocador de frames
+// contíguos, usamos buffers `static` — fazem parte da imagem do
+// kernel carregada pelo bootloader como um bloco físico único, ao
+// contrário do heap (cujas páginas podem vir de frames físicos
+// dispersos). Verificamos isso em runtime com `verify_contiguous`
+// antes de confiar neles para DMA — se falhar, caímos de volta para
+// o modo simulado em vez de arriscar corromper memória.
 
-const VIRTQ_SIZE: usize = 64; // deve ser potência de 2
+const MAX_QSZ:      usize = 256;
+const VRING_BYTES:  usize = 3 * 4096; // margem generosa p/ qsz até 256
+const RX_BUF_COUNT: usize = 32;
+const TX_BUF_COUNT: usize = 32;
+const PKT_BUF_SIZE: usize = 2048; // hdr(10) + frame Ethernet (até 1514)
+const VNET_HDR_LEN: usize = 10;   // virtio_net_hdr legacy sem MRG_RXBUF
 
-#[allow(dead_code)]
+const VIRTQ_DESC_F_WRITE: u16 = 2; // descritor escrito pelo device (RX)
+
+#[repr(C, align(4096))]
+struct AlignedVring([u8; VRING_BYTES]);
+
 #[repr(C, align(16))]
-struct VirtqDescTable {
-    descs: [VirtqDescPhys; VIRTQ_SIZE],
+struct PktBufPool([[u8; PKT_BUF_SIZE]; RX_BUF_COUNT]); // RX_BUF_COUNT==TX_BUF_COUNT
+
+static mut RX_VRING: AlignedVring = AlignedVring([0; VRING_BYTES]);
+static mut TX_VRING: AlignedVring = AlignedVring([0; VRING_BYTES]);
+static mut RX_BUFS:  PktBufPool   = PktBufPool([[0; PKT_BUF_SIZE]; RX_BUF_COUNT]);
+static mut TX_BUFS:  PktBufPool   = PktBufPool([[0; PKT_BUF_SIZE]; TX_BUF_COUNT]);
+
+fn align_up(x: usize, a: usize) -> usize { (x + a - 1) & !(a - 1) }
+
+/// Confirma que um bloco de `len` bytes a partir de `virt` está
+/// mapeado em física CONTÍGUA (verifica o início e cada fronteira de
+/// página). Devolve o endereço físico do início se sim.
+unsafe fn verify_contiguous(virt_start: u64, len: usize) -> Option<u64> {
+    let start_phys = crate::memory::virt_to_phys(x86_64::VirtAddr::new(virt_start))?.as_u64();
+    let mut off = 0usize;
+    while off < len {
+        let v = virt_start + off as u64;
+        let p = crate::memory::virt_to_phys(x86_64::VirtAddr::new(v))?.as_u64();
+        if p != start_phys + off as u64 {
+            return None;
+        }
+        off += 4096;
+    }
+    Some(start_phys)
 }
 
-#[allow(dead_code)]
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct VirtqDescPhys {
-    addr:  u64,
-    len:   u32,
-    flags: u16,
-    next:  u16,
+/// Layout calculado de uma virtqueue já registada no device — apenas
+/// ponteiros/offsets, sem dono dos dados (os buffers são `static`).
+#[derive(Clone, Copy)]
+struct VringLayout {
+    base:      *mut u8,
+    qsz:       u16,
+    avail_off: usize,
+    used_off:  usize,
+}
+unsafe impl Send for VringLayout {}
+
+impl VringLayout {
+    fn desc_off(idx: u16) -> usize { idx as usize * 16 }
+
+    unsafe fn set_desc(&self, idx: u16, addr: u64, len: u32, flags: u16, next: u16) {
+        let o = Self::desc_off(idx);
+        core::ptr::write_volatile(self.base.add(o) as *mut u64, addr);
+        core::ptr::write_volatile(self.base.add(o + 8) as *mut u32, len);
+        core::ptr::write_volatile(self.base.add(o + 12) as *mut u16, flags);
+        core::ptr::write_volatile(self.base.add(o + 14) as *mut u16, next);
+    }
+
+    unsafe fn avail_idx(&self) -> u16 {
+        core::ptr::read_volatile(self.base.add(self.avail_off + 2) as *const u16)
+    }
+    unsafe fn set_avail_idx(&self, v: u16) {
+        core::ptr::write_volatile(self.base.add(self.avail_off + 2) as *mut u16, v);
+    }
+    unsafe fn set_avail_ring(&self, slot: u16, desc_idx: u16) {
+        let o = self.avail_off + 4 + (slot as usize % self.qsz as usize) * 2;
+        core::ptr::write_volatile(self.base.add(o) as *mut u16, desc_idx);
+    }
+
+    unsafe fn used_idx(&self) -> u16 {
+        core::ptr::read_volatile(self.base.add(self.used_off + 2) as *const u16)
+    }
+    /// (desc_id, len) do elemento `slot` do used ring
+    unsafe fn used_elem(&self, slot: u16) -> (u32, u32) {
+        let o = self.used_off + 4 + (slot as usize % self.qsz as usize) * 8;
+        (
+            core::ptr::read_volatile(self.base.add(o) as *const u32),
+            core::ptr::read_volatile(self.base.add(o + 4) as *const u32),
+        )
+    }
 }
 
-#[allow(dead_code)]
-#[repr(C, align(2))]
-struct VirtqAvail {
-    flags: u16,
-    idx:   u16,
-    ring:  [u16; VIRTQ_SIZE],
-}
+/// Regista e activa uma virtqueue (RX=0, TX=1) no device.
+unsafe fn setup_vring(regs: &VirtioRegs, queue_idx: u16, vring_buf: *mut u8) -> Option<VringLayout> {
+    regs.set_queue_select(queue_idx);
+    let qsz = regs.queue_size();
+    if qsz == 0 || qsz as usize > MAX_QSZ {
+        crate::serial_println!("[VIRTIO-REAL] Queue {} tamanho invalido: {}", queue_idx, qsz);
+        return None;
+    }
 
-#[allow(dead_code)]
-#[repr(C)]
-struct VirtqUsedElem {
-    id:  u32,
-    len: u32,
-}
+    let desc_bytes  = 16 * qsz as usize;
+    let avail_bytes = 6 + 2 * qsz as usize;
+    let used_off    = align_up(desc_bytes + avail_bytes, 4096);
+    let used_bytes  = 6 + 8 * qsz as usize;
+    let total       = used_off + used_bytes;
+    if total > VRING_BYTES {
+        crate::serial_println!("[VIRTIO-REAL] Queue {} nao cabe no buffer estatico ({} > {})",
+            queue_idx, total, VRING_BYTES);
+        return None;
+    }
 
-#[allow(dead_code)]
-#[repr(C, align(4))]
-struct VirtqUsed {
-    flags: u16,
-    idx:   u16,
-    ring:  [VirtqUsedElem; VIRTQ_SIZE],
+    core::ptr::write_bytes(vring_buf, 0, total);
+
+    let phys = match verify_contiguous(vring_buf as u64, total) {
+        Some(p) => p,
+        None => {
+            crate::serial_println!("[VIRTIO-REAL] Vring da queue {} nao e fisicamente contigua — a usar modo simulado", queue_idx);
+            return None;
+        }
+    };
+    if phys & 0xFFF != 0 {
+        crate::serial_println!("[VIRTIO-REAL] Vring da queue {} nao esta alinhada a pagina", queue_idx);
+        return None;
+    }
+
+    regs.set_queue_addr((phys >> 12) as u32);
+
+    Some(VringLayout { base: vring_buf, qsz, avail_off: desc_bytes, used_off })
 }
 
 // ─── Driver Físico virtio-net ─────────────────────────────────
@@ -229,14 +329,21 @@ pub struct VirtioNetReal {
     pub iobase:      u16,
     pub mac:         [u8; 6],
     pub link_up:     bool,
-    /// Buffers TX (simplificado — pool fixo)
-    tx_buffers:      Vec<Vec<u8>>,
-    tx_avail_idx:    u16,
-    tx_last_used:    u16,
-    /// Buffers RX
-    rx_buffers:      Vec<Vec<u8>>,
-    rx_avail_idx:    u16,
-    rx_last_used:    u16,
+    /// Virtqueues reais (None se DMA não pôde ser configurado — ver
+    /// `setup_vring`/`verify_contiguous`)
+    rx_ring:      Option<VringLayout>,
+    tx_ring:      Option<VringLayout>,
+    rx_bufs_base: *mut u8,
+    rx_bufs_phys: u64,
+    tx_bufs_base: *mut u8,
+    tx_bufs_phys: u64,
+    rx_used_seen: u16,
+    tx_next:      u16,
+    /// Fallback em memória, usado só se a DMA real não ficar
+    /// disponível (ex: verify_contiguous falhou) — mantém o kernel a
+    /// funcionar em modo degradado em vez de desligar a rede.
+    tx_buffers: Vec<Vec<u8>>,
+    rx_buffers: Vec<Vec<u8>>,
     /// Estatísticas
     pub tx_packets:  u64,
     pub rx_packets:  u64,
@@ -244,6 +351,7 @@ pub struct VirtioNetReal {
     pub rx_bytes:    u64,
     pub tx_dropped:  u64,
 }
+unsafe impl Send for VirtioNetReal {}
 
 impl VirtioNetReal {
     pub const fn new() -> Self {
@@ -252,12 +360,16 @@ impl VirtioNetReal {
             iobase:      0,
             mac:         [0; 6],
             link_up:     false,
-            tx_buffers:  Vec::new(),
-            tx_avail_idx: 0,
-            tx_last_used: 0,
-            rx_buffers:  Vec::new(),
-            rx_avail_idx: 0,
-            rx_last_used: 0,
+            rx_ring:      None,
+            tx_ring:      None,
+            rx_bufs_base: core::ptr::null_mut(),
+            rx_bufs_phys: 0,
+            tx_bufs_base: core::ptr::null_mut(),
+            tx_bufs_phys: 0,
+            rx_used_seen: 0,
+            tx_next:      0,
+            tx_buffers: Vec::new(),
+            rx_buffers: Vec::new(),
             tx_packets:  0,
             rx_packets:  0,
             tx_bytes:    0,
@@ -304,7 +416,9 @@ impl VirtioNetReal {
         // 4. Negocia features (queremos MAC + STATUS)
         let features = regs.device_features();
         crate::serial_println!("[VIRTIO-REAL] Device features: 0x{:08x}", features);
-        // Aceita MAC e STATUS se disponíveis
+        // Aceita MAC e STATUS se disponíveis. Não negociamos MRG_RXBUF
+        // nem GSO/checksum offload — mantém o virtio_net_hdr simples,
+        // fixo em 10 bytes (VNET_HDR_LEN) em todos os buffers.
         let driver_features = features & (1 << 5 | 1 << 16); // F_MAC | F_STATUS
         regs.set_driver_features(driver_features);
 
@@ -316,10 +430,55 @@ impl VirtioNetReal {
             self.mac[0], self.mac[1], self.mac[2],
             self.mac[3], self.mac[4], self.mac[5]);
 
-        // 6. Sinaliza DRIVER_OK
+        // 6. Virtqueue setup — RX (0) e TX (1). Se qualquer uma falhar
+        // (device incomum, ou memória DMA não contígua), continuamos
+        // sem DMA real: initialized fica false e quem chamou cai para
+        // o driver simulado (ver `init_physical`).
+        unsafe {
+            let rx_vring_ptr = core::ptr::addr_of_mut!(RX_VRING.0) as *mut u8;
+            let tx_vring_ptr = core::ptr::addr_of_mut!(TX_VRING.0) as *mut u8;
+            let rx_bufs_ptr  = core::ptr::addr_of_mut!(RX_BUFS.0) as *mut u8;
+            let tx_bufs_ptr  = core::ptr::addr_of_mut!(TX_BUFS.0) as *mut u8;
+
+            let rx_ring = setup_vring(&regs, 0, rx_vring_ptr);
+            let tx_ring = setup_vring(&regs, 1, tx_vring_ptr);
+            let rx_bufs_phys = verify_contiguous(rx_bufs_ptr as u64, RX_BUF_COUNT * PKT_BUF_SIZE);
+            let tx_bufs_phys = verify_contiguous(tx_bufs_ptr as u64, TX_BUF_COUNT * PKT_BUF_SIZE);
+
+            match (rx_ring, tx_ring, rx_bufs_phys, tx_bufs_phys) {
+                (Some(rx), Some(tx), Some(rxp), Some(txp)) => {
+                    self.rx_ring = Some(rx);
+                    self.tx_ring = Some(tx);
+                    self.rx_bufs_base = rx_bufs_ptr;
+                    self.rx_bufs_phys = rxp;
+                    self.tx_bufs_base = tx_bufs_ptr;
+                    self.tx_bufs_phys = txp;
+
+                    // Pré-popula o RX ring com buffers vazios para o
+                    // device poder começar a preencher imediatamente.
+                    let n = RX_BUF_COUNT.min(rx.qsz as usize) as u16;
+                    for i in 0..n {
+                        let buf_phys = rxp + (i as usize * PKT_BUF_SIZE) as u64;
+                        rx.set_desc(i, buf_phys, PKT_BUF_SIZE as u32, VIRTQ_DESC_F_WRITE, 0);
+                        rx.set_avail_ring(i, i);
+                    }
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                    rx.set_avail_idx(n);
+                    regs.notify_queue(0);
+
+                    crate::serial_println!("[VIRTIO-REAL] Virtqueues RX/TX reais configuradas (qsz={}/{})",
+                        rx.qsz, tx.qsz);
+                }
+                _ => {
+                    crate::serial_println!("[VIRTIO-REAL] DMA real indisponivel — TX/RX ficam simulados em memoria");
+                }
+            }
+        }
+
+        // 7. Sinaliza DRIVER_OK
         regs.set_device_status(0x07); // ACK | DRIVER | DRIVER_OK
 
-        // 7. Verifica status final
+        // 8. Verifica status final
         let status = regs.device_status();
         if status & 0x80 != 0 {
             crate::serial_println!("[VIRTIO-REAL] Device sinalizou FAILED (0x{:02x})", status);
@@ -334,7 +493,8 @@ impl VirtioNetReal {
         true
     }
 
-    /// Envia um frame Ethernet (real port I/O)
+    /// Envia um frame Ethernet (DMA real via virtqueue TX, se
+    /// configurada; caso contrário cai para o buffer em memória)
     pub fn transmit_real(&mut self, frame: Vec<u8>) -> bool {
         if !self.initialized || !self.link_up {
             self.tx_dropped += 1;
@@ -345,31 +505,98 @@ impl VirtioNetReal {
             return false;
         }
 
-        // Prepend virtio-net header (12 bytes zeros para legacy)
-        let mut buf = alloc::vec![0u8; 12];
-        buf.extend_from_slice(&frame);
+        let Some(tx) = self.tx_ring else {
+            // Sem DMA real disponível: mantém o comportamento antigo
+            // (buffer em memória) como fallback, para não perder a
+            // funcionalidade em hardware/QEMU não suportado.
+            let mut buf = alloc::vec![0u8; 12];
+            buf.extend_from_slice(&frame);
+            self.tx_buffers.push(buf);
+            self.tx_packets += 1;
+            self.tx_bytes   += frame.len() as u64;
+            let regs = VirtioRegs::new(self.iobase);
+            regs.notify_queue(1);
+            return true;
+        };
 
-        let len = buf.len() as u64;
-        // Guarda no buffer TX (simulado — em hardware real usaria DMA)
-        self.tx_buffers.push(buf);
-        self.tx_packets += 1;
-        self.tx_bytes   += len;
+        if VNET_HDR_LEN + frame.len() > PKT_BUF_SIZE {
+            self.tx_dropped += 1;
+            return false;
+        }
 
-        // Notifica o device (TX queue = 1)
+        unsafe {
+            let slot = (self.tx_next as usize) % TX_BUF_COUNT;
+            self.tx_next = self.tx_next.wrapping_add(1);
+
+            let buf_ptr = self.tx_bufs_base.add(slot * PKT_BUF_SIZE);
+            // virtio_net_hdr legacy: 10 bytes a zero (sem GSO/checksum offload)
+            core::ptr::write_bytes(buf_ptr, 0, VNET_HDR_LEN);
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), buf_ptr.add(VNET_HDR_LEN), frame.len());
+
+            let total_len  = (VNET_HDR_LEN + frame.len()) as u32;
+            let buf_phys   = self.tx_bufs_phys + (slot * PKT_BUF_SIZE) as u64;
+            let desc_idx   = slot as u16;
+            tx.set_desc(desc_idx, buf_phys, total_len, 0, 0);
+
+            let avail_slot = tx.avail_idx();
+            tx.set_avail_ring(avail_slot, desc_idx);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            tx.set_avail_idx(avail_slot.wrapping_add(1));
+        }
+
         let regs = VirtioRegs::new(self.iobase);
         regs.notify_queue(1);
 
+        self.tx_packets += 1;
+        self.tx_bytes   += frame.len() as u64;
         true
     }
 
-    /// Polling de frames RX recebidos
+    /// Polling de frames RX recebidos (lê o used ring real da
+    /// virtqueue RX, se configurada; caso contrário devolve o buffer
+    /// de simulação/testes preenchido via `inject_rx`)
     pub fn receive_real(&mut self) -> Vec<Vec<u8>> {
         if !self.initialized { return Vec::new(); }
-        // Em implementação real: verificar used ring da RX queue
-        // Por agora: retorna buffers acumulados (simulado)
-        let frames = self.rx_buffers.drain(..).collect::<Vec<_>>();
-        let count = frames.len() as u64;
-        self.rx_packets += count;
+
+        let Some(rx) = self.rx_ring else {
+            let frames = self.rx_buffers.drain(..).collect::<Vec<_>>();
+            self.rx_packets += frames.len() as u64;
+            return frames;
+        };
+
+        let mut frames = Vec::new();
+        unsafe {
+            let new_used_idx = rx.used_idx();
+            while self.rx_used_seen != new_used_idx {
+                let slot = self.rx_used_seen;
+                let (desc_id, len) = rx.used_elem(slot);
+                self.rx_used_seen = self.rx_used_seen.wrapping_add(1);
+
+                let desc_id = desc_id as usize;
+                if desc_id < RX_BUF_COUNT && (len as usize) > VNET_HDR_LEN {
+                    let buf_ptr = self.rx_bufs_base.add(desc_id * PKT_BUF_SIZE);
+                    let payload_len = ((len as usize) - VNET_HDR_LEN).min(PKT_BUF_SIZE - VNET_HDR_LEN);
+                    let mut v = alloc::vec![0u8; payload_len];
+                    core::ptr::copy_nonoverlapping(buf_ptr.add(VNET_HDR_LEN), v.as_mut_ptr(), payload_len);
+                    frames.push(v);
+
+                    // Devolve o buffer ao device para reutilização
+                    let buf_phys = self.rx_bufs_phys + (desc_id * PKT_BUF_SIZE) as u64;
+                    rx.set_desc(desc_id as u16, buf_phys, PKT_BUF_SIZE as u32, VIRTQ_DESC_F_WRITE, 0);
+                    let avail_slot = rx.avail_idx();
+                    rx.set_avail_ring(avail_slot, desc_id as u16);
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                    rx.set_avail_idx(avail_slot.wrapping_add(1));
+                }
+            }
+        }
+
+        if !frames.is_empty() {
+            let regs = VirtioRegs::new(self.iobase);
+            regs.notify_queue(0);
+        }
+        self.rx_packets += frames.len() as u64;
+        self.rx_bytes   += frames.iter().map(|f| f.len() as u64).sum::<u64>();
         frames
     }
 

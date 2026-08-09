@@ -793,12 +793,17 @@ fn cmd_net() {
         if s.initialized {"ATIVO"} else {"INATIVO"}, s.hostname);
     crate::serial_println!("IP: {} | {} interfaces ({} up)",
         s.primary_ip.unwrap_or_else(|| "N/A".into()), s.interfaces, s.link_up);
-    let (tx_p, rx_p, tx_b, rx_b) = crate::net::virtio::get_stats();
+    // NOTA (bug corrigido): isto lia crate::net::virtio (driver
+    // paralelo 100% simulado, nunca ligado ao hardware) em vez de
+    // net::virtio_real (o driver real, ver Fase 7 / P2P UDP real) —
+    // por isso os números aqui nunca batiam certo com o comando 'pci'.
+    let (tx_p, rx_p, tx_b, rx_b) = crate::net::virtio_real::stats();
     crate::serial_println!("virtio-net TX:{} pkts/{} B | RX:{} pkts/{} B",
         tx_p, tx_b, rx_p, rx_b);
-    crate::serial_println!("MAC: {} | Link: {}",
-        crate::net::virtio::get_mac().to_string(),
-        if crate::net::virtio::is_up() {"UP"} else {"DOWN"});
+    let mac = crate::net::virtio_real::mac();
+    crate::serial_println!("MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} | Link: {}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        if crate::net::virtio_real::is_up() {"UP"} else {"DOWN"});
 }
 fn cmd_syscall() {
     let (total, errors) = crate::syscall::get_stats();
