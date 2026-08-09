@@ -29,6 +29,7 @@
 // ============================================================
 
 extern crate alloc;
+use crate::crypto::{sha256_multi, Hash256};
 use alloc::{
     string::{String, ToString},
     vec::Vec,
@@ -39,36 +40,14 @@ use spinning_top::Spinlock;
 // ─── Hash simples (SHA-256 simulado) ─────────────────────────
 // Em produção: usar sha2 crate. Aqui: FNV-like para no_std.
 
+/// SHA-256 real via crate::crypto
 fn hash_bytes(data: &[u8]) -> [u8; 32] {
-    let mut h: [u64; 4] = [
-        0xcbf29ce484222325,
-        0x84222325cbf29ce4,
-        0x14650fb0739d0383,
-        0x739d038314650fb0,
-    ];
-    for (i, &byte) in data.iter().enumerate() {
-        let slot = i % 4;
-        h[slot] ^= byte as u64;
-        h[slot] = h[slot].wrapping_mul(0x00000100000001b3);
-        h[slot] ^= h[slot] >> 32;
-    }
-    let mut out = [0u8; 32];
-    for (i, &v) in h.iter().enumerate() {
-        out[i*8..(i+1)*8].copy_from_slice(&v.to_le_bytes());
-    }
-    out
+    crate::crypto::sha256(data)
 }
 
+/// Hex display do hash (primeiros 8 bytes) via crate::crypto
 fn hash_to_hex(h: &[u8; 32]) -> String {
-    let mut s = String::new();
-    for &b in h.iter().take(8) {
-        let hi = b >> 4;
-        let lo = b & 0xf;
-        s.push(if hi < 10 { (b'0' + hi) as char } else { (b'a' + hi - 10) as char });
-        s.push(if lo < 10 { (b'0' + lo) as char } else { (b'a' + lo - 10) as char });
-    }
-    s.push_str("...");
-    s
+    crate::crypto::hash_short(h)
 }
 
 // ─── Tipos de blocos ──────────────────────────────────────────
@@ -342,7 +321,7 @@ impl SyncEngine {
             dag:               Dag::new(),
             pending_broadcast: Vec::new(),
             last_sync_tick:    0,
-            sync_interval:     300, // ~5 segundos a 60Hz
+            sync_interval:     18000, // ~5 minutos a 60Hz — sem spam no terminal
         }
     }
 
@@ -399,22 +378,15 @@ impl SyncEngine {
         self.last_sync_tick = current_tick;
 
         if !self.pending_broadcast.is_empty() {
-            crate::serial_println!("[DAG] sync tick={} — {} blocos a propagar",
-                current_tick, self.pending_broadcast.len());
-            // Simula broadcast via P2P gossip
+            // Sync silencioso — sem spam no terminal
             self.broadcast_pending();
         }
     }
 
     fn broadcast_pending(&mut self) {
-        let count = self.pending_broadcast.len();
         // Em Fase 4: enviar via p2p::transport::send()
-        // Por agora: simula e limpa a fila
-        for hash in &self.pending_broadcast {
-            crate::serial_println!("[DAG][BROADCAST] bloco={}", hash_to_hex(hash));
-        }
+        // Por agora: limpa a fila silenciosamente
         self.pending_broadcast.clear();
-        crate::serial_println!("[DAG] {} blocos propagados aos peers", count);
     }
 
     /// Prepara um "sync offer" — lista de hashes que temos

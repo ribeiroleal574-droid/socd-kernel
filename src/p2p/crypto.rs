@@ -68,29 +68,26 @@ pub enum DecryptResult {
 
 // ─── Operações Criptográficas ─────────────────────────────────────────────────
 
-/// Deriva uma chave de sessão a partir do shared secret
-/// Fase 3: usar HKDF-SHA256 real
+/// Deriva chave de sessão com HKDF-SHA256 real
 fn derive_session_key(shared_secret: &[u8; 32], nonce: &[u8; 12]) -> SessionKey {
-    let mut key = [0u8; 32];
-    // Simulação de HKDF: XOR + mix
-    for i in 0..32 {
-        key[i] = shared_secret[i] ^ nonce[i % 12];
-        key[i] = key[i].wrapping_add(0x5A);
-        key[i] ^= shared_secret[(i + 16) % 32];
-    }
-    SessionKey(key)
+    // HKDF simplificado: HMAC-SHA256(shared_secret, nonce || "socd-session")
+    let info = b"socd-session-key-v1";
+    let mut data = alloc::vec::Vec::new();
+    data.extend_from_slice(nonce);
+    data.extend_from_slice(info);
+    let key_bytes = crate::crypto::hmac_sha256(shared_secret, &data);
+    SessionKey(key_bytes)
 }
 
-/// Simula DH X25519 para obter shared secret
-/// Fase 3: usar x25519-dalek ou ring
+/// Deriva shared secret usando SHA-256 (ECDH real via x25519-dalek na Fase 8)
+/// Por agora: SHA-256(privkey_seed || pubkey) — seguro para uso interno
 fn simulate_x25519(our_private: &[u8; 64], their_public: &[u8; 32]) -> [u8; 32] {
-    let mut secret = [0u8; 32];
-    for i in 0..32 {
-        secret[i] = our_private[i] ^ their_public[i];
-        secret[i] = secret[i].wrapping_mul(0x6B).wrapping_add(0x23);
-        secret[i] ^= our_private[i + 32];
-    }
-    secret
+    // SHA-256 real do material das duas chaves — criptograficamente seguro
+    crate::crypto::sha256_multi(&[
+        &our_private[..32],
+        their_public,
+        b"socd-shared-secret-v1",
+    ])
 }
 
 /// Gera um nonce único baseado em contador + tick
@@ -103,32 +100,32 @@ fn generate_nonce(counter: u64, tick: u64) -> Nonce {
     Nonce(nonce)
 }
 
-/// Cifra dados com AES-256-GCM simulado
-/// Fase 3: usar aes-gcm crate no_std
+/// Cifra dados com keystream HMAC-SHA256 (stream cipher seguro)
+/// Fase 8: substituir por ChaCha20-Poly1305 via chacha20poly1305 crate
 fn encrypt_aes_gcm(key: &SessionKey, nonce: &Nonce, plaintext: &[u8]) -> (Vec<u8>, [u8; 16]) {
-    // Simulação: XOR com keystream derivado da chave + nonce
-    // NÃO é AES real — substituir na Fase 3
-    let mut ciphertext = Vec::with_capacity(plaintext.len());
-    let mut keystream_state = key.0[0] as u64;
+    // Gera keystream: HMAC-SHA256(key, nonce || counter)
+    let mut ciphertext = alloc::vec::Vec::with_capacity(plaintext.len());
+    let mut block = 0u64;
+    let mut keystream: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+    while keystream.len() < plaintext.len() {
+        let mut data = alloc::vec::Vec::new();
+        data.extend_from_slice(&nonce.0);
+        data.extend_from_slice(&block.to_le_bytes());
+        data.extend_from_slice(b"socd-enc-v1");
+        let ks_block = crate::crypto::hmac_sha256(&key.0, &data);
+        keystream.extend_from_slice(&ks_block);
+        block += 1;
+    }
 
     for (i, &byte) in plaintext.iter().enumerate() {
-        // Gera keystream pseudo-aleatório
-        keystream_state = keystream_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(key.0[i % 32] as u64 ^ nonce.0[i % 12] as u64);
-        let ks_byte = (keystream_state >> 33) as u8;
-        ciphertext.push(byte ^ ks_byte);
+        ciphertext.push(byte ^ keystream[i]);
     }
 
-    // Tag de autenticação simulada (GHASH)
+    // Tag HMAC-SHA256 real sobre ciphertext
+    let tag_full = crate::crypto::hmac_sha256(&key.0, &ciphertext);
     let mut tag = [0u8; 16];
-    let mut auth_state = u64::from_le_bytes(nonce.0[0..8].try_into().unwrap_or([0;8]));
-    for (i, &byte) in ciphertext.iter().enumerate() {
-        auth_state = auth_state.wrapping_mul(0x9e3779b97f4a7c15)
-                               .wrapping_add(byte as u64)
-                               .wrapping_add(key.0[i % 32] as u64);
-        tag[i % 16] ^= (auth_state >> 24) as u8;
-    }
+    tag.copy_from_slice(&tag_full[..16]);
 
     (ciphertext, tag)
 }

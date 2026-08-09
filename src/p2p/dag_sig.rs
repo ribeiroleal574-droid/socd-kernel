@@ -102,42 +102,30 @@ pub struct DagSignature(pub [u8; 64]);
 impl DagSignature {
     pub const ZERO: DagSignature = DagSignature([0u8; 64]);
 
-    /// Assina um hash de bloco com a chave privada
+    /// Assina um hash de bloco com Ed25519 real
     pub fn sign(block_hash: &[u8; 32], private_key: &[u8; 64],
                 public_key: &[u8; 32]) -> Self {
-        let signing_key = derive_signing_key(private_key);
-        let mac = hmac_like(&signing_key, block_hash);
-
-        let mut sig = [0u8; 64];
-        sig[0..32].copy_from_slice(&mac);
-        sig[32..64].copy_from_slice(public_key);
-        DagSignature(sig)
+        // Usa os primeiros 32 bytes da chave privada como seed Ed25519
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&private_key[..32]);
+        let ed25519_sig = crate::crypto::sign(&seed, block_hash);
+        DagSignature(ed25519_sig)
     }
 
-    /// Verifica se esta assinatura é válida para o hash e chave pública dados
+    /// Verifica assinatura Ed25519 real com a chave pública
     pub fn verify(&self, block_hash: &[u8; 32], public_key: &[u8; 32]) -> bool {
-        // Extrai a chave pública embutida na assinatura
-        let embedded_pubkey = &self.0[32..64];
-        if embedded_pubkey != public_key.as_slice() {
-            return false; // Chave pública não coincide
-        }
-        // Verifica o HMAC — precisamos da signing_key derivada da chave privada
-        // Como não temos a chave privada aqui, usamos a chave pública como proxy
-        // Em produção: verificação real Ed25519 com apenas a pubkey
-        // Aqui: verificação relaxada — confirma que o campo mac não é zero
-        let mac = &self.0[0..32];
-        mac != [0u8; 32].as_slice()
+        if self.is_zero() { return false; }
+        crate::crypto::verify_signature(public_key, block_hash, &self.0)
     }
 
-    /// Verificação completa: hash + assinatura + autor
+    /// Verificação completa (mantida por compatibilidade)
     pub fn verify_full(
         &self,
         block_hash: &[u8; 32],
         public_key: &[u8; 32],
-        private_key: &[u8; 64], // necessário para recomputar
+        _private_key: &[u8; 64],
     ) -> bool {
-        let expected = DagSignature::sign(block_hash, private_key, public_key);
-        expected.0 == self.0
+        self.verify(block_hash, public_key)
     }
 
     pub fn is_zero(&self) -> bool {
@@ -146,15 +134,12 @@ impl DagSignature {
 
     /// Primeiros 8 bytes em hex (para display)
     pub fn short_hex(&self) -> alloc::string::String {
-        let mut s = alloc::string::String::new();
-        for &b in self.0.iter().take(4) {
-            let hi = b >> 4;
-            let lo = b & 0xf;
-            s.push(if hi < 10 { (b'0'+hi) as char } else { (b'a'+hi-10) as char });
-            s.push(if lo < 10 { (b'0'+lo) as char } else { (b'a'+lo-10) as char });
-        }
-        s.push_str("..");
-        s
+        // hash_short espera 32 bytes; a assinatura tem 64 — usamos só
+        // os primeiros 32 para o prefixo de display (não é um hash,
+        // mas serve igualmente para um identificador visual curto).
+        let mut prefix = [0u8; 32];
+        prefix.copy_from_slice(&self.0[..32]);
+        crate::crypto::hash_short(&prefix)
     }
 }
 
@@ -220,6 +205,7 @@ impl SignedBlock {
         self.signature.verify(&self.hash, &self.author)
     }
 
+    /// SHA-256 real do bloco
     fn compute_hash(
         parents: &[[u8; 32]],
         author:  &[u8; 32],
@@ -228,14 +214,11 @@ impl SignedBlock {
         payload: &[u8],
         seq:     u64,
     ) -> [u8; 32] {
-        let mut data: Vec<u8> = Vec::new();
-        for p in parents { data.extend_from_slice(p); }
-        data.extend_from_slice(author);
-        data.extend_from_slice(&tick.to_le_bytes());
-        data.extend_from_slice(path.as_bytes());
-        data.extend_from_slice(payload);
-        data.extend_from_slice(&seq.to_le_bytes());
-        hash_fnv(&data)
+        crate::crypto::dag_block_hash(
+            parents, author, tick,
+            0x01, // File kind
+            path, payload, seq,
+        )
     }
 }
 

@@ -41,6 +41,14 @@ pc-keyboard = "0.5"
 # PIC8259 — controlador de interrupções
 pic8259 = "0.10"
 
+# ── Criptografia Real ─────────────────────────────────────────
+sha2        = { version = "0.10", default-features = false }
+hmac        = { version = "0.12", default-features = false }
+digest      = { version = "0.10", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
+getrandom   = { version = "0.2", features = ["custom"] }
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

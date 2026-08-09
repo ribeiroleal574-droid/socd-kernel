@@ -146,16 +146,38 @@ pub struct CpuContext {
     pub rax: u64,
 
     // Registradores de controle de fluxo
-    pub rip:    u64,  // Próxima instrução a executar
+    pub rip:    u64,  // Próxima instrução a executar (informativo — ver kernel_rsp)
     pub cs:     u64,  // Code segment
     pub rflags: u64,  // Status flags (interrupts, zero, carry, etc.)
-    pub rsp:    u64,  // Stack pointer
+    pub rsp:    u64,  // Stack pointer (informativo — ver kernel_rsp)
     pub ss:     u64,  // Stack segment
+
+    /// RSP real usado pela troca de contexto (`arch::context_switch`).
+    /// Ao contrário dos campos acima (mantidos por razões informativas
+    /// e de compatibilidade), este é o valor lido/escrito a cada troca
+    /// de tarefa — aponta para a pilha da tarefa, construída por
+    /// `arch::context_switch::prepare_initial_stack` na criação, e
+    /// actualizado a cada `switch_context`.
+    pub kernel_rsp: u64,
 }
 
 impl CpuContext {
-    /// Cria um contexto inicial para uma nova tarefa
+    /// Cria um contexto inicial para uma nova tarefa de kernel.
+    ///
+    /// `stack_top` deve ser o topo de uma pilha exclusiva desta tarefa
+    /// (ver `ProcessControlBlock::new_kernel_task`), usada para montar
+    /// o frame inicial que o trampolim de arranque vai desempilhar.
     pub fn new_kernel_task(entry_point: u64, stack_top: u64) -> Self {
+        let kernel_rsp = if stack_top == 0 {
+            // stack_top == 0 é usado por `register_current_as_task`,
+            // que regista uma execução já em curso (sem pilha própria
+            // pré-construída) — o valor real é preenchido na primeira
+            // troca de saída dessa tarefa.
+            0
+        } else {
+            unsafe { crate::arch::context_switch::prepare_initial_stack(stack_top, entry_point) }
+        };
+
         Self {
             rip: entry_point,
             rsp: stack_top,
@@ -164,6 +186,9 @@ impl CpuContext {
             ss: 0x10,
             // IF=1 (interrupções habilitadas), IOPL=0, reserved=1
             rflags: 0x200,
+            kernel_rsp,
+            // Registos de uso geral: 0 (só relevantes como snapshot
+            // informativo — a troca real usa apenas `kernel_rsp`).
             ..Default::default()
         }
     }
@@ -414,18 +439,35 @@ impl Scheduler {
                     return true; // Solicita troca de contexto
                 }
             }
+            false
+        } else {
+            // Sem tarefa actual (ex: a última tarefa acabou de terminar
+            // via exit_process, que limpa current_pid). Sem isto, o
+            // scheduler nunca mais chamava `schedule()` — ficava preso
+            // em hlt() para sempre, porque este `if let` nunca voltava
+            // a entrar aqui. Há sempre trabalho a considerar (nem que
+            // seja só o idle), por isso pedimos sempre uma troca.
+            true
         }
-
-        false
     }
 
     /// Seleciona o próximo processo a executar (Round-Robin com prioridade).
     /// Retorna o PID do próximo processo, se houver.
     pub fn schedule(&mut self) -> Option<Pid> {
-        // Coloca o processo atual de volta na fila (se ainda rodável)
+        // Coloca o processo atual de volta na fila — só se ainda
+        // estiver `Running` (ou seja, não foi entretanto bloqueado,
+        // posto a dormir, ou terminado por outro caminho enquanto era
+        // a tarefa corrente).
+        //
+        // NOTA (bug corrigido): isto usava `proc.is_runnable()`, que só
+        // aceita os estados Ready|New — mas a tarefa corrente está
+        // sempre em `Running` neste ponto, nunca Ready. Com a condição
+        // antiga, nenhuma tarefa alguma vez voltava à fila depois de
+        // ser escalonada pela primeira vez: desaparecia do round-robin
+        // para sempre. `Running` é a verificação correcta aqui.
         if let Some(current) = self.current_pid {
             if let Some(proc) = self.get_process_mut(current) {
-                if proc.is_runnable() {
+                if matches!(proc.state, ProcessState::Running) {
                     proc.state = ProcessState::Ready;
                     proc.reset_quantum();
                     proc.stats.preempt_count += 1;
@@ -605,9 +647,152 @@ pub fn timer_tick() -> bool {
     SCHEDULER.lock().tick()
 }
 
-/// Seleciona o próximo processo
+/// Seleciona o próximo processo (só bookkeeping — não troca de pilha).
+/// Mantido para compatibilidade (ex: porta ARM); em x86_64 usar
+/// `preempt()` ou `yield_now()`, que executam a troca real.
 pub fn schedule() -> Option<Pid> {
     SCHEDULER.lock().schedule()
+}
+
+/// RSP "de despejo" usado quando não há nenhuma tarefa actual válida
+/// para onde guardar o contexto que está a sair (não devia acontecer
+/// em operação normal, uma vez que `register_current_as_task` garante
+/// sempre uma tarefa actual). Single-core: sem necessidade de ser
+/// per-CPU nem atómico.
+static mut DUMMY_RSP: u64 = 0;
+
+/// Regista a execução ACTUAL (por exemplo, o `kernel_loop` do
+/// arranque) como uma tarefa normal do scheduler, para que possa ser
+/// trocada de/para tal como qualquer outra.
+///
+/// Ao contrário de `spawn`, não constrói uma pilha nova nem um
+/// trampolim — a "pilha inicial" desta tarefa é simplesmente onde ela
+/// já está a correr agora. O `kernel_rsp` fica a 0 até à primeira vez
+/// que for trocada para fora (nesse momento, `switch_context`
+/// preenche-o com o RSP real desta execução).
+///
+/// Deve ser chamada exactamente uma vez, imediatamente depois de
+/// `scheduler::init()`, a partir do código que vai tornar-se o loop
+/// principal do kernel.
+pub fn register_current_as_task(name: &str, priority: Priority) -> Pid {
+    let mut sched = SCHEDULER.lock();
+    let pid = alloc_pid();
+    let sandbox_pid = crate::security::sandbox::create_process_sandbox(
+        name,
+        crate::security::TrustLevel::System,
+    );
+    let pcb = ProcessControlBlock {
+        pid,
+        parent_pid: 0,
+        name: name.to_string(),
+        state: ProcessState::Running,
+        priority,
+        // stack_top=0 ⇒ CpuContext::new_kernel_task não constrói frame
+        // inicial (ver comentário nesse método).
+        context: CpuContext::new_kernel_task(0, 0),
+        cpu_ticks_total: 0,
+        quantum_remaining: priority.quantum(),
+        created_at_tick: sched.tick,
+        stack: Vec::new(), // usa a pilha já activa desta execução
+        sandbox_pid,
+        stats: ProcessStats::default(),
+    };
+    sched.processes.push(pcb);
+    sched.current_pid = Some(pid);
+    crate::serial_println!("[SCHED] Tarefa actual registada: '{}' PID={}", name, pid);
+    pid
+}
+
+/// Ponto de decisão + troca REAL de contexto, chamado pelo handler do
+/// timer (IRQ0) a cada tick. Faz o bookkeeping normal (`tick`) e, se o
+/// quantum da tarefa actual expirou, escolhe a próxima e efectivamente
+/// troca de pilha via `arch::context_switch::switch_context`.
+///
+/// Tem de ser chamada SEM nenhum outro Spinlock do scheduler retido, e
+/// o lock interno é sempre largado antes da troca de pilha em si.
+pub fn preempt() {
+    let mut sched = SCHEDULER.lock();
+
+    // Actualiza contadores; diz se o quantum da tarefa actual expirou.
+    if !sched.tick() {
+        return;
+    }
+
+    let old_pid = sched.current_pid;
+
+    let next_pid = match sched.schedule() {
+        Some(pid) => pid,
+        None => return, // não devia acontecer — há sempre o idle
+    };
+
+    // Nada a trocar se a própria tarefa foi re-seleccionada (única
+    // tarefa pronta, por exemplo).
+    if old_pid == Some(next_pid) {
+        return;
+    }
+
+    let old_rsp_ptr: *mut u64 = match old_pid.and_then(|pid| sched.get_process_mut(pid)) {
+        Some(p) => &mut p.context.kernel_rsp as *mut u64,
+        None => &raw mut DUMMY_RSP,
+    };
+
+    let new_rsp = match sched.get_process(next_pid) {
+        Some(p) => p.context.kernel_rsp,
+        None => return,
+    };
+
+    // Larga o lock ANTES de trocar de pilha: esta chamada só "regressa"
+    // quando a tarefa actual for escolhida de novo — e nesse meio
+    // tempo outras tarefas vão chamar preempt()/yield_now() e precisam
+    // de conseguir bloquear o scheduler.
+    drop(sched);
+
+    unsafe {
+        crate::arch::context_switch::switch_context(old_rsp_ptr, new_rsp);
+    }
+}
+
+/// Cedência voluntária de CPU (syscall `yield`): igual a `preempt()`
+/// mas sem depender do quantum ter expirado — troca sempre que há
+/// outra tarefa pronta.
+pub fn yield_now() {
+    let mut sched = SCHEDULER.lock();
+
+    let old_pid = sched.current_pid;
+
+    let next_pid = match sched.schedule() {
+        Some(pid) => pid,
+        None => return,
+    };
+
+    if old_pid == Some(next_pid) {
+        return;
+    }
+
+    let old_rsp_ptr: *mut u64 = match old_pid.and_then(|pid| sched.get_process_mut(pid)) {
+        Some(p) => &mut p.context.kernel_rsp as *mut u64,
+        None => &raw mut DUMMY_RSP,
+    };
+
+    let new_rsp = match sched.get_process(next_pid) {
+        Some(p) => p.context.kernel_rsp,
+        None => return,
+    };
+
+    drop(sched);
+
+    unsafe {
+        crate::arch::context_switch::switch_context(old_rsp_ptr, new_rsp);
+    }
+}
+
+/// Termina a tarefa actualmente em execução (chamado pelo trampolim de
+/// arranque se a função de entrada de uma tarefa alguma vez retornar).
+pub fn exit_current(exit_code: i32) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(pid) = sched.current_pid {
+        sched.exit_process(pid, exit_code);
+    }
 }
 
 /// Coloca o processo atual para dormir

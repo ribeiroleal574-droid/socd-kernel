@@ -13,6 +13,14 @@ target = "x86_64-unknown-none"
 runner = "bootimage runner"
 rustflags = [
     "-C", "relocation-model=static",
+    # Força o curve25519-dalek a usar o backend "fiat" (puro Rust,
+    # constant-time, sem instruções SIMD/AVX). Sem isto, a crate
+    # auto-deteta e tenta usar o backend "simd" mesmo neste alvo
+    # bare-metal com SSE desativado (-mmx,-sse,+soft-float no target
+    # spec), o que faz o LLVM falhar a compilar ("Do not know how to
+    # split the result of this operator") — o alvo não tem unidade
+    # SSE/AVX para o código vetorial gerado.
+    "--cfg", "curve25519_dalek_backend=\"fiat\"",
 ]
 
 # Aliases úteis

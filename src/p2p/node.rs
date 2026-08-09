@@ -82,27 +82,17 @@ pub struct LocalNode {
 
 impl LocalNode {
     /// Cria um novo nó com identidade gerada deterministicamente
-    /// Na Fase 3: usar TRNG (True Random Number Generator) do TPM
-    fn generate(seed: u64) -> Self {
-        // Simulação determinística de geração de chaves
-        // Em produção: usar Curve25519/Ed25519 real via libsodium ou ring
-        let mut key_material = [0u8; 96];
-        let mut rng = seed;
-        for byte in key_material.iter_mut() {
-            // xorshift64 simples para seed
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            *byte = (rng & 0xFF) as u8;
-        }
-
-        let mut public_key = [0u8; 32];
+    /// Gera par de chaves Ed25519 real com entropia de hardware
+    fn generate(_seed: u64) -> Self {
+        // Ed25519 real via crate::crypto
+        let kp = crate::crypto::KeyPair::generate();
+        let public_key = kp.verifying_key;
         let mut private_key = [0u8; 64];
-        public_key.copy_from_slice(&key_material[0..32]);
-        private_key.copy_from_slice(&key_material[0..64]);
+        private_key[..32].copy_from_slice(&kp.signing_key);
+        private_key[32..].copy_from_slice(&kp.verifying_key);
 
-        // NodeId = SHA-256 simulado da chave pública
-        let node_id = simple_hash(&public_key);
+        // NodeId = SHA-256 real da chave pública
+        let node_id = crate::crypto::pubkey_to_node_id(&public_key);
 
         Self {
             node_id,

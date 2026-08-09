@@ -28,6 +28,8 @@ mod wasm;
 mod xr;
 mod quantum;
 mod net;
+mod crypto;  // Criptografia real: SHA-256 + Ed25519 + HMAC-SHA256
+mod getrandom_impl; // Entropia para ed25519-dalek em no_std
 mod syscall;
 // NOTE: Removidas as declarações duplicadas de `mod p2p`, `mod ia` e
 //       `mod syscall` que existiam no final do ficheiro original.
@@ -70,6 +72,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[OK] Memoria e heap inicializados ({} KB heap)",
         memory::heap::HEAP_SIZE / 1024);
 
+    // ── 6b: Criptografia Real (precisa do heap para o backend
+    //        `alloc` do curve25519-dalek/ed25519-dalek) ────────
+    crypto::init();
+    serial_println!("[OK] Criptografia real: SHA-256 + Ed25519 + HMAC");
+
     // ── 7: Modules ────────────────────────────────────────────
     modules::registry::init();
     serial_println!("[OK] Registro de modulos ativo");
@@ -90,7 +97,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // ── 10: Scheduler ─────────────────────────────────────────
     modules::scheduler::init();
-    serial_println!("[OK] Scheduler preemptivo ativo");
+    // Regista esta própria execução (o resto do boot + kernel_loop)
+    // como uma tarefa normal do scheduler, para que a troca de
+    // contexto real possa preemptá-la e retomá-la tal como a qualquer
+    // outra tarefa (ver arch::context_switch e o comando 'ps').
+    modules::scheduler::register_current_as_task("kernel_main", modules::scheduler::Priority::Normal);
+    serial_println!("[OK] Scheduler preemptivo ativo (troca de contexto real)");
 
     // ── 11: Keyboard ──────────────────────────────────────────
     drivers::keyboard::init();

@@ -40,16 +40,12 @@ impl Optimizer {
 
         match &action {
             OptimizationAction::TriggerSync { priority } => {
-                crate::serial_println!(
-                    "[IA][OPT] tick={} Iniciando sync P2P (prioridade={:?})", tick, priority
-                );
                 // Fase 3: chamar p2p::sync::trigger()
+                // Log silenciado — demasiado verboso no terminal
             }
             OptimizationAction::AdjustSchedulerQuantum { idle_boost } => {
                 if *idle_boost {
-                    crate::serial_println!(
-                        "[IA][OPT] tick={} CPU ociosa — boost para processos interativos", tick
-                    );
+                    // Log silenciado
                 }
             }
             OptimizationAction::IsolateProcess { pid } => {

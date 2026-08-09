@@ -6,6 +6,7 @@
 pub mod gdt;          // Global Descriptor Table
 pub mod interrupts;   // IDT + handlers de interrupção
 pub mod port;         // Acesso a portas de I/O
+pub mod context_switch; // Troca de contexto real (stack switching)
 
 /// Inicializa todos os subsistemas de arquitetura em ordem.
 pub fn init() {

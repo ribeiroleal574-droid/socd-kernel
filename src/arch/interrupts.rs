@@ -94,7 +94,16 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
         crate::ui::shell::tick(tick);
     }
 
+    // IMPORTANTE: o EOI tem de ser enviado ANTES de uma possível troca
+    // de contexto. `preempt()` pode não "regressar" aqui durante vários
+    // ticks (só volta quando esta tarefa for escolhida de novo) — se o
+    // EOI ficasse pendente até depois disso, o PIC nunca mais deixava
+    // passar interrupções de timer, travando a preempção por completo.
     unsafe { PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8()); }
+
+    // Verifica preempção e, se necessário, troca de tarefa de facto
+    // (troca real de pilha — ver arch::context_switch).
+    crate::modules::scheduler::preempt();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

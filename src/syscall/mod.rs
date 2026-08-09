@@ -166,7 +166,7 @@ pub fn dispatch(args: &SyscallArgs) -> SyscallResult {
         10 => sys_exit(args),
         13 => sys_getpid(args),
         14 => sys_sleep(args),
-        15 => { crate::modules::scheduler::schedule(); 0 }, // yield
+        15 => { crate::modules::scheduler::yield_now(); 0 }, // yield (troca real de contexto)
 
         // ── Rede ────────────────────────────────────────────────────
         30 => sys_socket(args),
@@ -257,8 +257,12 @@ fn sys_readdir(_: &SyscallArgs) -> SyscallResult { Errno::ENOSYS.as_i64() }
 fn sys_exit(args: &SyscallArgs) -> SyscallResult {
     let code = args.a0 as i32;
     crate::serial_println!("[SYSCALL] exit({})", code);
-    crate::modules::scheduler::SCHEDULER.lock()
-        .exit_process(1, code);
+    // NOTA: corrigido — chamava exit_process(1, ...) fixo, matando
+    // sempre o PID 1 em vez do processo que realmente pediu exit().
+    crate::modules::scheduler::exit_current(code);
+    // Não faz sentido continuar a executar código desta tarefa depois
+    // de exit() — cede a CPU de imediato (troca real de contexto).
+    crate::modules::scheduler::yield_now();
     0
 }
 
