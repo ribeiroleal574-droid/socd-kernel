@@ -76,29 +76,31 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 
 static TICK_COUNT: Spinlock<u64> = Spinlock::new(0);
 
+/// Tick actual, para código em contexto de tarefa normal (não-ISR)
+/// poder sondar subsistemas periodicamente — ver `kernel_loop` em
+/// main.rs. Ler isto nunca bloqueia por muito tempo (é só um u64).
+pub fn current_tick() -> u64 {
+    *TICK_COUNT.lock()
+}
+
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // NOTA (bug de concorrência corrigido): este handler chegou a
+    // chamar directamente os "tick" de vários subsistemas (P2P,
+    // gossip, IA, edge, UI, sondagem de rede) — código com Spinlocks
+    // próprios. Isso é perigoso: se uma tarefa normal estiver a meio
+    // de segurar um desses locks exactamente quando o timer dispara,
+    // o handler fica preso à espera de um lock que a tarefa
+    // interrompida nunca mais consegue libertar (não pode correr
+    // enquanto estivermos presos dentro desta própria interrupção —
+    // um único core). Isto só passou a ser um risco real depois da
+    // troca de contexto real existir (antes, nunca havia verdadeira
+    // concorrência entre tarefas). Agora o handler só faz o mínimo:
+    // incrementa o tick, envia EOI, e decide preempção. O trabalho
+    // periódico dos subsistemas passa a correr em `kernel_loop()`
+    // (contexto de tarefa normal, preemptível em segurança).
     let mut ticks = TICK_COUNT.lock();
     *ticks += 1;
     drop(ticks);
-
-    // Tick subsystems every N ticks
-    let tick = *TICK_COUNT.lock();
-    if tick % 1000 == 0 {
-        crate::p2p::discovery::tick(tick);
-        crate::p2p::gossip::tick(tick);
-        crate::ia::tick(tick);
-        crate::edge::tick(tick);
-    }
-    if tick % 16 == 0 {
-        // ~60fps UI update
-        crate::ui::shell::tick(tick);
-    }
-    if tick % 20 == 0 {
-        // Sondagem da rede real (virtio-net) — mais frequente que os
-        // outros subsistemas porque pacotes UDP P2P recebidos ficam
-        // parados nos buffers RX até serem drenados.
-        crate::p2p::transport::poll_receive();
-    }
 
     // IMPORTANTE: o EOI tem de ser enviado ANTES de uma possível troca
     // de contexto. `preempt()` pode não "regressar" aqui durante vários

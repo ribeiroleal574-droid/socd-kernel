@@ -58,14 +58,14 @@ unsafe fn pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
 }
 
 /// Lê 16 bits do PCI config space
-unsafe fn pci_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
+pub(crate) unsafe fn pci_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
     let val = pci_read32(bus, dev, func, offset & !3);
     let shift = (offset & 2) * 8;
     (val >> shift) as u16
 }
 
 /// Escreve 16 bits no PCI config space
-unsafe fn pci_write16(bus: u8, dev: u8, func: u8, offset: u8, value: u16) {
+pub(crate) unsafe fn pci_write16(bus: u8, dev: u8, func: u8, offset: u8, value: u16) {
     let val = pci_read32(bus, dev, func, offset & !3);
     let shift = (offset & 2) * 8;
     let mask  = !(0xFFFFu32 << shift);

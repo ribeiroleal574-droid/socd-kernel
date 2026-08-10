@@ -30,6 +30,7 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use spinning_top::Spinlock;
+use x86_64::instructions::interrupts::without_interrupts;
 
 // ─── Identificadores ──────────────────────────────────────────────────────────
 
@@ -633,25 +634,34 @@ pub static SCHEDULER: Spinlock<Scheduler> = Spinlock::new(Scheduler::new());
 
 /// Inicializa o scheduler global
 pub fn init() {
-    SCHEDULER.lock().init();
+    without_interrupts(|| SCHEDULER.lock().init());
     crate::serial_println!("[SCHED] Sistema de processos pronto");
 }
 
 /// Cria uma nova tarefa
+///
+/// NOTA (bug de deadlock corrigido): isto aloca uma pilha de 64KB
+/// para a tarefa nova enquanto segura o lock do SCHEDULER. Sem
+/// `without_interrupts`, se o timer disparasse exactamente durante
+/// essa alocação, o handler da interrupção (que também bloqueia
+/// SCHEDULER, em `preempt()`) ficava preso para sempre à espera de um
+/// lock que esta chamada, interrompida a meio, nunca mais conseguia
+/// libertar — um deadlock cujo ponto de paragem parecia aleatório,
+/// porque dependia só de quando o timer calhava disparar.
 pub fn spawn(name: &str, entry: fn(), priority: Priority) -> Pid {
-    SCHEDULER.lock().spawn(name, entry as u64, priority)
+    without_interrupts(|| SCHEDULER.lock().spawn(name, entry as u64, priority))
 }
 
 /// Chamado pelo timer IRQ — verifica preempção
 pub fn timer_tick() -> bool {
-    SCHEDULER.lock().tick()
+    without_interrupts(|| SCHEDULER.lock().tick())
 }
 
 /// Seleciona o próximo processo (só bookkeeping — não troca de pilha).
 /// Mantido para compatibilidade (ex: porta ARM); em x86_64 usar
 /// `preempt()` ou `yield_now()`, que executam a troca real.
 pub fn schedule() -> Option<Pid> {
-    SCHEDULER.lock().schedule()
+    without_interrupts(|| SCHEDULER.lock().schedule())
 }
 
 /// RSP "de despejo" usado quando não há nenhuma tarefa actual válida
@@ -675,6 +685,7 @@ static mut DUMMY_RSP: u64 = 0;
 /// `scheduler::init()`, a partir do código que vai tornar-se o loop
 /// principal do kernel.
 pub fn register_current_as_task(name: &str, priority: Priority) -> Pid {
+    without_interrupts(|| {
     let mut sched = SCHEDULER.lock();
     let pid = alloc_pid();
     let sandbox_pid = crate::security::sandbox::create_process_sandbox(
@@ -701,6 +712,7 @@ pub fn register_current_as_task(name: &str, priority: Priority) -> Pid {
     sched.current_pid = Some(pid);
     crate::serial_println!("[SCHED] Tarefa actual registada: '{}' PID={}", name, pid);
     pid
+    })
 }
 
 /// Ponto de decisão + troca REAL de contexto, chamado pelo handler do
@@ -756,6 +768,7 @@ pub fn preempt() {
 /// mas sem depender do quantum ter expirado — troca sempre que há
 /// outra tarefa pronta.
 pub fn yield_now() {
+    without_interrupts(|| {
     let mut sched = SCHEDULER.lock();
 
     let old_pid = sched.current_pid;
@@ -784,41 +797,46 @@ pub fn yield_now() {
     unsafe {
         crate::arch::context_switch::switch_context(old_rsp_ptr, new_rsp);
     }
+    })
 }
 
 /// Termina a tarefa actualmente em execução (chamado pelo trampolim de
 /// arranque se a função de entrada de uma tarefa alguma vez retornar).
 pub fn exit_current(exit_code: i32) {
-    let mut sched = SCHEDULER.lock();
-    if let Some(pid) = sched.current_pid {
-        sched.exit_process(pid, exit_code);
-    }
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        if let Some(pid) = sched.current_pid {
+            sched.exit_process(pid, exit_code);
+        }
+    });
 }
 
 /// Coloca o processo atual para dormir
 pub fn sleep(ticks: u64) {
-    SCHEDULER.lock().sleep_current(ticks);
+    without_interrupts(|| SCHEDULER.lock().sleep_current(ticks));
 }
 
 /// Estatísticas globais
 pub fn get_stats() -> SchedulerStats {
-    SCHEDULER.lock().stats()
+    without_interrupts(|| SCHEDULER.lock().stats())
 }
 
 /// Lista todos os processos
 pub fn list_processes() -> Vec<ProcessInfo> {
-    SCHEDULER.lock().list_processes()
+    without_interrupts(|| SCHEDULER.lock().list_processes())
 }
 
 /// Termina um processo pelo PID (Fase 2)
 pub fn kill(pid: Pid, exit_code: i32) -> bool {
-    let mut sched = SCHEDULER.lock();
-    if sched.get_process(pid).is_some() {
-        sched.exit_process(pid, exit_code);
-        true
-    } else {
-        false
-    }
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        if sched.get_process(pid).is_some() {
+            sched.exit_process(pid, exit_code);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 

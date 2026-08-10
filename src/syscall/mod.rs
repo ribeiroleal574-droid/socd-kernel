@@ -146,10 +146,12 @@ pub struct SyscallArgs {
 /// Dispatcher principal de syscalls
 pub fn dispatch(args: &SyscallArgs) -> SyscallResult {
     // Verifica sandbox antes de qualquer syscall
-    let pid = crate::modules::scheduler::SCHEDULER.lock()
-        .get_process(1)
-        .map(|p| p.sandbox_pid)
-        .unwrap_or(0);
+    let pid = x86_64::instructions::interrupts::without_interrupts(|| {
+        crate::modules::scheduler::SCHEDULER.lock()
+            .get_process(1)
+            .map(|p| p.sandbox_pid)
+            .unwrap_or(0)
+    });
 
     match args.nr {
         // ── Arquivo / FS ─────────────────────────────────────────────
@@ -267,8 +269,10 @@ fn sys_exit(args: &SyscallArgs) -> SyscallResult {
 }
 
 fn sys_getpid(_: &SyscallArgs) -> SyscallResult {
-    crate::modules::scheduler::SCHEDULER.lock()
-        .stats().current_pid.unwrap_or(1) as i64
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        crate::modules::scheduler::SCHEDULER.lock()
+            .stats().current_pid.unwrap_or(1) as i64
+    })
 }
 
 fn sys_sleep(args: &SyscallArgs) -> SyscallResult {

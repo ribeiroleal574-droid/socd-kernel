@@ -92,6 +92,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     security::threat::init();
     serial_println!("[OK] IA defensiva ativa");
 
+    // ── 8c: Disco virtio-blk (Fase 8 — TmpFS em disco) ───────
+    // Tem de vir ANTES do TmpFS, para o snapshot poder ser
+    // carregado do disco já na inicialização. Se não houver disco
+    // associado no QEMU (-drive + -device virtio-blk-pci), fica
+    // graciosamente sem persistência — TmpFS funciona só em RAM
+    // como antes.
+    drivers::virtio_blk::init_physical();
+
     // ── 9: TmpFS ──────────────────────────────────────────────
     modules::tmpfs::init();
     serial_println!("[OK] TmpFS inicializado");
@@ -229,16 +237,44 @@ fn kernel_loop() -> ! {
     // para evitar overflow quando cognitive.last_tick foi definido
     // durante o boot com valores altos
     let mut tick: u64 = crate::modules::scheduler::get_stats().current_tick;
+    let mut last_bg_tick: u64 = 0;
     loop {
         drivers::serial_shell::tick();
         // Motores de background chamados a cada iteração do loop
-        // NOTA: ia::tick() é chamado pelo timer interrupt (interrupts.rs)
         ia::cognitive::cognitive_tick(tick);   // Cognitivo: a cada 60 ticks
         p2p::dag::sync_tick(tick);             // DAG sync: a cada 300 ticks
         security::threat::threat_tick(tick);   // Threat: a cada 120 ticks
         ui::ar::ar_tick(tick);                 // AR: expira holograms
         modules::virt::virt_tick(tick);        // Containers: limites recursos
         modules::monitor::monitor_tick(tick);  // Monitor: captura a cada 60 ticks
+
+        // Trabalho periódico que ANTES corria dentro do handler do
+        // timer (interrupts.rs). Movido para aqui — contexto de
+        // tarefa normal — porque correr código com Spinlocks próprios
+        // directamente numa interrupção de hardware é perigoso assim
+        // que há troca de contexto real: se uma tarefa estiver a
+        // meio de segurar um desses locks quando o timer dispara, a
+        // interrupção fica presa à espera de um lock que nunca mais
+        // é libertado (deadlock). Usa o tick real do hardware
+        // (arch::interrupts::current_tick), não o contador local do
+        // loop, para manter a mesma cadência de antes.
+        let real_tick = arch::interrupts::current_tick();
+        if real_tick != last_bg_tick {
+            last_bg_tick = real_tick;
+            if real_tick % 1000 == 0 {
+                p2p::discovery::tick(real_tick);
+                p2p::gossip::tick(real_tick);
+                ia::tick(real_tick);
+                edge::tick(real_tick);
+            }
+            if real_tick % 16 == 0 {
+                ui::shell::tick(real_tick);
+            }
+            if real_tick % 20 == 0 {
+                p2p::transport::poll_receive();
+            }
+        }
+
         tick = tick.saturating_add(1);
         x86_64::instructions::hlt();
     }

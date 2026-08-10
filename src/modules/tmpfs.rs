@@ -36,6 +36,9 @@ pub type InodeId = u64;
 
 const ROOT_INODE: InodeId = 1;
 
+/// Assinatura no início de um snapshot válido em disco
+const SNAPSHOT_MAGIC: &[u8; 8] = b"SOCDFS01";
+
 static NEXT_INODE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(2);
 
@@ -391,6 +394,169 @@ impl TmpFs {
 
         TmpFsStats { total_inodes, total_bytes, files, dirs }
     }
+
+    // ─── Snapshot em disco (Fase 8) ──────────────────────────
+
+    /// Serializa todo o TmpFS para bytes (formato binário simples,
+    /// próprio — sem serde, para não trazer dependências pesadas
+    /// para um kernel bare-metal). Usado para gravar um snapshot no
+    /// disco virtio-blk.
+    pub fn serialize(&self, next_inode: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        fn push_u16(b: &mut Vec<u8>, v: u16) { b.extend_from_slice(&v.to_le_bytes()); }
+        fn push_u32(b: &mut Vec<u8>, v: u32) { b.extend_from_slice(&v.to_le_bytes()); }
+        fn push_u64(b: &mut Vec<u8>, v: u64) { b.extend_from_slice(&v.to_le_bytes()); }
+        fn push_str(b: &mut Vec<u8>, s: &str) {
+            push_u16(b, s.len() as u16);
+            b.extend_from_slice(s.as_bytes());
+        }
+
+        buf.extend_from_slice(SNAPSHOT_MAGIC);
+        push_u64(&mut buf, 0); // placeholder para total_len, preenchido no fim
+        push_u64(&mut buf, next_inode);
+        push_u64(&mut buf, self.current_tick);
+        push_u32(&mut buf, self.inodes.len() as u32);
+
+        for inode in self.inodes.values() {
+            push_u64(&mut buf, inode.id);
+            push_str(&mut buf, &inode.name);
+            let kind_byte = match inode.kind {
+                InodeKind::Directory => 0u8,
+                InodeKind::File      => 1u8,
+                InodeKind::Symlink   => 2u8,
+            };
+            buf.push(kind_byte);
+            let perm_byte = (inode.perms.read as u8)
+                | ((inode.perms.write as u8) << 1)
+                | ((inode.perms.execute as u8) << 2);
+            buf.push(perm_byte);
+            push_u64(&mut buf, inode.created_at);
+            push_u64(&mut buf, inode.modified_at);
+
+            match &inode.content {
+                InodeContent::FileData(data) => {
+                    buf.push(1);
+                    push_u32(&mut buf, data.len() as u32);
+                    buf.extend_from_slice(data);
+                }
+                InodeContent::DirEntries(map) => {
+                    buf.push(0);
+                    push_u32(&mut buf, map.len() as u32);
+                    for (name, child_id) in map {
+                        push_str(&mut buf, name);
+                        push_u64(&mut buf, *child_id);
+                    }
+                }
+                InodeContent::SymlinkTarget(target) => {
+                    buf.push(2);
+                    push_str(&mut buf, target);
+                }
+            }
+        }
+
+        let total_len = buf.len() as u64;
+        buf[8..16].copy_from_slice(&total_len.to_le_bytes());
+        buf
+    }
+
+    /// Reconstrói um TmpFS a partir de bytes gravados por `serialize`.
+    /// Devolve também o valor de `next_inode` guardado, para o
+    /// contador global `NEXT_INODE` poder ser restaurado.
+    pub fn deserialize(data: &[u8]) -> Option<(Self, u64)> {
+        if data.len() < 8 + 8 + 8 + 8 + 4 { return None; }
+        if &data[0..8] != SNAPSHOT_MAGIC { return None; }
+
+        let mut off = 8usize;
+        fn read_u16(d: &[u8], o: usize) -> u16 { u16::from_le_bytes([d[o], d[o+1]]) }
+        fn read_u32(d: &[u8], o: usize) -> u32 { u32::from_le_bytes([d[o], d[o+1], d[o+2], d[o+3]]) }
+        fn read_u64(d: &[u8], o: usize) -> u64 {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&d[o..o+8]);
+            u64::from_le_bytes(a)
+        }
+
+        let total_len = read_u64(data, off); off += 8;
+        if total_len as usize > data.len() { return None; } // snapshot truncado/corrompido
+
+        let next_inode = read_u64(data, off); off += 8;
+        let current_tick = read_u64(data, off); off += 8;
+        let inode_count = read_u32(data, off); off += 4;
+
+        let mut inodes = BTreeMap::new();
+
+        for _ in 0..inode_count {
+            if off + 8 > data.len() { return None; }
+            let id = read_u64(data, off); off += 8;
+
+            if off + 2 > data.len() { return None; }
+            let name_len = read_u16(data, off) as usize; off += 2;
+            if off + name_len > data.len() { return None; }
+            let name = core::str::from_utf8(&data[off..off+name_len]).ok()?.to_string();
+            off += name_len;
+
+            if off + 2 > data.len() { return None; }
+            let kind = match data[off] {
+                0 => InodeKind::Directory,
+                1 => InodeKind::File,
+                2 => InodeKind::Symlink,
+                _ => return None,
+            };
+            let perm_byte = data[off+1];
+            off += 2;
+            let perms = Permissions {
+                read:    perm_byte & 0x1 != 0,
+                write:   perm_byte & 0x2 != 0,
+                execute: perm_byte & 0x4 != 0,
+            };
+
+            if off + 16 > data.len() { return None; }
+            let created_at = read_u64(data, off); off += 8;
+            let modified_at = read_u64(data, off); off += 8;
+
+            if off + 1 > data.len() { return None; }
+            let content_tag = data[off]; off += 1;
+            let content = match content_tag {
+                1 => {
+                    if off + 4 > data.len() { return None; }
+                    let len = read_u32(data, off) as usize; off += 4;
+                    if off + len > data.len() { return None; }
+                    let d = data[off..off+len].to_vec();
+                    off += len;
+                    InodeContent::FileData(d)
+                }
+                0 => {
+                    if off + 4 > data.len() { return None; }
+                    let count = read_u32(data, off); off += 4;
+                    let mut map = BTreeMap::new();
+                    for _ in 0..count {
+                        if off + 2 > data.len() { return None; }
+                        let nlen = read_u16(data, off) as usize; off += 2;
+                        if off + nlen > data.len() { return None; }
+                        let name = core::str::from_utf8(&data[off..off+nlen]).ok()?.to_string();
+                        off += nlen;
+                        if off + 8 > data.len() { return None; }
+                        let child_id = read_u64(data, off); off += 8;
+                        map.insert(name, child_id);
+                    }
+                    InodeContent::DirEntries(map)
+                }
+                2 => {
+                    if off + 2 > data.len() { return None; }
+                    let tlen = read_u16(data, off) as usize; off += 2;
+                    if off + tlen > data.len() { return None; }
+                    let target = core::str::from_utf8(&data[off..off+tlen]).ok()?.to_string();
+                    off += tlen;
+                    InodeContent::SymlinkTarget(target)
+                }
+                _ => return None,
+            };
+
+            inodes.insert(id, Inode { id, name, kind, perms, created_at, modified_at, content });
+        }
+
+        Some((Self { inodes, current_tick }, next_inode))
+    }
 }
 
 /// Informações de um inode (equivalente ao stat() do Unix)
@@ -419,8 +585,21 @@ pub static TMPFS: Spinlock<TmpFs> = Spinlock::new(TmpFs {
     current_tick: 0,
 });
 
-/// Inicializa o TmpFS global com a estrutura de diretórios padrão
+/// Inicializa o TmpFS global — tenta primeiro carregar um snapshot
+/// válido do disco virtio-blk (ver `load_from_disk`); se não houver
+/// disco, ou não houver snapshot válido ainda (primeiro arranque),
+/// cria a estrutura de diretórios padrão em RAM e grava-a no disco
+/// (se disponível) para o próximo arranque já ter algo para carregar.
 pub fn init() {
+    if load_from_disk() {
+        let stats = TMPFS.lock().fs_stats();
+        crate::serial_println!(
+            "[TMPFS] Snapshot carregado do disco: {} inodes ({} dirs, {} arquivos)",
+            stats.total_inodes, stats.dirs, stats.files
+        );
+        return;
+    }
+
     let mut fs = TMPFS.lock();
     *fs = TmpFs::new();
     let stats = fs.fs_stats();
@@ -428,6 +607,49 @@ pub fn init() {
         "[TMPFS] Inicializado: {} inodes ({} dirs, {} arquivos)",
         stats.total_inodes, stats.dirs, stats.files
     );
+    drop(fs);
+    if save_to_disk() {
+        crate::serial_println!("[TMPFS] Snapshot inicial gravado no disco");
+    }
+}
+
+/// Grava um snapshot completo do TmpFS no disco virtio-blk (sector 0
+/// em diante). Sem efeito (devolve false) se não houver disco real
+/// disponível — TmpFS continua a funcionar normalmente só em RAM.
+pub fn save_to_disk() -> bool {
+    if !crate::drivers::virtio_blk::is_up() { return false; }
+    let next_inode = NEXT_INODE.load(core::sync::atomic::Ordering::Relaxed);
+    let data = TMPFS.lock().serialize(next_inode);
+    crate::drivers::virtio_blk::write_at(0, &data)
+}
+
+/// Carrega um snapshot do disco virtio-blk, se existir e for válido.
+/// Lê primeiro um bloco pequeno para confirmar a assinatura e o
+/// tamanho total, depois lê exactamente esse tamanho.
+pub fn load_from_disk() -> bool {
+    if !crate::drivers::virtio_blk::is_up() { return false; }
+
+    let mut header = alloc::vec![0u8; 512];
+    if !crate::drivers::virtio_blk::read_at(0, &mut header) { return false; }
+    if &header[0..8] != SNAPSHOT_MAGIC { return false; }
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&header[8..16]);
+    let total_len = u64::from_le_bytes(len_bytes) as usize;
+    if total_len == 0 || total_len > 64 * 1024 * 1024 { return false; } // limite defensivo (64 MB)
+
+    let padded_len = (total_len + 511) & !511;
+    let mut data = alloc::vec![0u8; padded_len];
+    if !crate::drivers::virtio_blk::read_at(0, &mut data) { return false; }
+    data.truncate(total_len);
+
+    match TmpFs::deserialize(&data) {
+        Some((fs, next_inode)) => {
+            *TMPFS.lock() = fs;
+            NEXT_INODE.store(next_inode, core::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Lê um arquivo por caminho absoluto
@@ -441,7 +663,10 @@ pub fn read(path: &str) -> Result<Vec<u8>, FsError> {
 pub fn write(path: &str, data: &[u8]) -> Result<(), FsError> {
     let mut fs = TMPFS.lock();
     let id = fs.resolve_path(path)?;
-    fs.write_file(id, data)
+    let result = fs.write_file(id, data);
+    drop(fs);
+    if result.is_ok() { save_to_disk(); }
+    result
 }
 
 /// Lista um diretório por caminho absoluto

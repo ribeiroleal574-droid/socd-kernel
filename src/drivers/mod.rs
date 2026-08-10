@@ -7,3 +7,4 @@ pub mod vga_dashboard;  // Dashboard visual na janela QEMU
 pub mod serial;         // UART serial (debug + input)
 pub mod keyboard;       // PS/2 Teclado
 pub mod serial_shell;   // Shell interativo via serial
+pub mod virtio_blk;     // Driver virtio-blk real (TmpFS em disco)
