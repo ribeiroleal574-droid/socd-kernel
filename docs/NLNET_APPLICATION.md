@@ -35,11 +35,13 @@ the kernel. Security is handled by a defensive AI subsystem that detects
 anomalous process behavior using heuristics and automatically quarantines
 suspicious processes.
 
-Current state: 84 Rust source files, ~21,000 lines of no_std kernel code,
-compiles and boots in QEMU, includes 46 automated tests, interactive shell with
-tab-completion, real virtio-net PCI driver, and full subsystem implementations
-for P2P, IA, UI, AR, Edge Computing, WASM, Quantum simulation, and cross-device
-synchronization.
+**Current state:** 90+ Rust source files, ~22,500 lines of no_std kernel code,
+compiles and boots in QEMU, includes 48 automated tests, interactive shell with
+tab-completion, a real virtio-net PCI driver with genuine DMA (descriptor
+rings, not simulated buffers), a real virtio-blk driver providing disk
+persistence, real preemptive multitasking (stack-switching scheduler), real
+Ed25519/SHA-256/HMAC cryptography, and a real (if simplified) TCP/UDP network
+stack — details in Section 6.
 
 ---
 
@@ -86,10 +88,20 @@ Kernel Core            → Scheduler, memoria, syscall, drivers
 ### Componentes Principais
 
 **DAG Distribuído com Criptografia**
-- Cada bloco de dados é assinado com HMAC da chave Ed25519 do nó
+- Cada bloco de dados é assinado com Ed25519 real (via `ed25519-dalek`,
+  backend `fiat` puro-Rust — sem SIMD, compatível com o alvo bare-metal)
 - Resolução de conflitos CRDT (Last-Write-Wins determinístico)
 - Blocos com assinatura inválida rejeitados na camada de rede
-- Sincronização via protocolo Gossip entre dispositivos do utilizador
+
+**Rede Real**
+- Driver virtio-net PCI com DMA genuína: descriptor table, avail ring e
+  used ring geridos directamente, sem camada de simulação por baixo
+- Transporte P2P sobre UDP real (Ethernet + IPv4 + UDP construídos e
+  transmitidos byte a byte)
+- Descoberta de nós via mDNS real (RFC 6762 — codificação/descodificação
+  DNS própria, sem dependências externas)
+- Sockets TCP/UDP genéricos com handshake TCP real (SYN/SYN-ACK/ACK) —
+  ver limitações na Secção 6
 
 **Motor Cognitivo**
 - Detecção de padrões comportamentais do utilizador
@@ -116,44 +128,76 @@ O SOC-D alinha-se directamente com os objectivos NGI:
 
 | Objectivo NGI | Como o SOC-D contribui |
 |---------------|------------------------|
-| Internet descentralizada | P2P sem servidores centrais |
+| Internet descentralizada | P2P sem servidores centrais, UDP real |
 | Privacidade por design | IA e dados locais, DAG criptográfico |
 | Soberania digital | Utilizador controla os seus dados |
 | Open source | MIT License, código público |
-| Inovação técnica | Primeiro OS com IA cognitiva no núcleo |
-| Interoperabilidade | WASM, POSIX syscalls, múltiplos runtimes |
+| Inovação técnica | Kernel com IA cognitiva e stack de rede próprios |
+| Interoperabilidade | WASM, POSIX syscalls, TCP/UDP, mDNS (RFC 6762) |
 
 ---
 
 ## 6. Estado Actual e Roadmap
 
-### Completado (7 fases)
-- Kernel bare-metal x86_64 funcional em QEMU
-- 84 ficheiros Rust, ~21 000 linhas no_std
-- P2P gossip + crypto + DAG + assinaturas
-- Motor cognitivo com padrões e automação
-- IA defensiva com quarentena automática
-- Interface AR holográfica (OpenXR)
-- Driver virtio-net PCI real
-- 46 testes automatizados
+### Completado
+
+Estes componentes correm de facto — construídos byte a byte, testados em
+QEMU, sem camada de simulação por baixo:
+
+- Kernel bare-metal x86_64 funcional em QEMU, ~22 500 linhas Rust `no_std`
+- **Scheduler preemptivo real**: troca de contexto via stack-switching
+  (técnica xv6), com trampolim de arranque e um scheduler
+  round-robin corrigido
+- **Criptografia real**: SHA-256, HMAC-SHA256, Ed25519 (crates auditadas,
+  backend puro-Rust sem SIMD para compatibilidade bare-metal)
+- **Driver de rede real**: virtio-net PCI com DMA genuína (virtqueues
+  legacy 0.9 completas — descriptor table, avail/used ring)
+- **Driver de disco real**: virtio-blk PCI, usado para persistência do
+  sistema de ficheiros (snapshot em disco, sobrevive a reinícios)
+- **P2P sobre UDP real**: transporte, descoberta mDNS (RFC 6762), e
+  sockets TCP/UDP genéricos com handshake real
+- **IA com inferência real**: 3 modelos MLP (redes neuronais pequenas
+  com multiplicação de matrizes e activações reais — ReLU/sigmoid),
+  substituindo heurísticas hardcoded
+- 48 testes automatizados, shell interactivo com tab-completion
+
+### Limitações actuais (honestidade técnica)
+
+Para um avaliador que vá ler o código, estas são as limitações conhecidas
+e não escondidas:
+
+- **Um único core**: o scheduler e os locks assumem execução single-core;
+  SMP exigiria uma revisão significativa da sincronização
+- **TCP simplificado**: handshake e transferência de dados funcionam,
+  mas sem retransmissão, controlo de congestão, ou reordenação de
+  pacotes fora de ordem
+- **Nunca testado entre dois dispositivos físicos**: toda a validação de
+  rede (P2P, mDNS, sockets) foi feita num único QEMU — falta confirmar
+  interoperabilidade real entre máquinas
+- **Sem driver WiFi**: só virtio-net (adequado para QEMU/VMs, não para
+  hardware físico de consumo)
+- **Subsistemas ainda decorativos**: o simulador quântico, o runtime XR,
+  e partes da UI gráfica existem mas não têm hardware real por trás —
+  não fazem parte do valor central do projecto (soberania de dados e
+  rede P2P) e não é onde o financiamento seria direccionado
 
 ### Com Financiamento NGI (12 meses)
 
-**Meses 1–4: Rede Real**
-- Transport UDP real para DAG (multicast local)
-- Sincronização entre 2 dispositivos físicos na mesma rede
-- Driver WiFi básico
+**Meses 1–4: Validação Física e Robustez de Rede**
+- Testar P2P/mDNS/sockets entre 2+ dispositivos físicos reais (não só QEMU)
+- Retransmissão e controlo de congestão no TCP
+- Driver WiFi básico (802.11, cartão comum)
 
-**Meses 5–8: IA Real**
-- Substituir modelos ML simulados por inferência real (TinyML/ONNX)
-- Motor cognitivo com aprendizagem efectiva de padrões
-- Modelos privados — treino local, sem cloud
+**Meses 5–8: Multi-Core (SMP)**
+- Arranque de APs (Application Processors) via ACPI/MADT
+- Scheduler e locks seguros para múltiplos cores
+- Per-CPU data structures onde necessário
 
 **Meses 9–12: Utilizabilidade**
 - Interface gráfica básica para utilizador não técnico
 - Packaging como ISO bootável
-- Documentação completa
 - Port para Raspberry Pi (ARM64)
+- Documentação completa
 
 ---
 
@@ -164,9 +208,17 @@ O SOC-D alinha-se directamente com os objectivos NGI:
 - Áreas: kernel development, P2P, criptografia aplicada
 - Projecto: SOC-D (autor e arquitecto principal)
 
+**Nota sobre metodologia**: partes significativas da implementação das
+fases descritas na Secção 6 ("Completado") foram desenvolvidas com
+assistência de um LLM (Claude, Anthropic) em modo de par-programação —
+o desenvolvedor definiu a arquitectura, tomou as decisões de scope, e
+validou cada fase em QEMU antes de avançar; o LLM ajudou a escrever e
+depurar o código Rust/asm de baixo nível. Achamos importante divulgar
+isto com transparência.
+
 **Procura de colaboradores** nas áreas de:
-- Network engineering (WiFi drivers, UDP real)
-- ML/AI engineering (modelos de inferência local)
+- Network engineering (WiFi drivers, testes multi-dispositivo)
+- Kernel/SMP engineering (multi-core, sincronização)
 - UX/Design (interface para utilizador final)
 
 ---
@@ -176,7 +228,7 @@ O SOC-D alinha-se directamente com os objectivos NGI:
 | Item | Valor |
 |------|-------|
 | Desenvolvimento principal (part-time) | 24 000€ |
-| Hardware de teste (3 dispositivos) | 1 500€ |
+| Hardware de teste (3+ dispositivos físicos, cartões WiFi) | 1 500€ |
 | Infraestrutura CI/CD | 600€ |
 | Documentação e tradução | 1 000€ |
 | Conferências / disseminação | 900€ |
@@ -186,7 +238,7 @@ O SOC-D alinha-se directamente com os objectivos NGI:
 
 ## 9. Links
 
-- Repositório: https://github.com/SEU_USER/socd-kernel
+- Repositório: https://github.com/ribeiroleal574-droid/socd-kernel
 - Licença: MIT
 - Linguagem: Rust (nightly)
 - Target: x86_64-unknown-none (bare metal)
@@ -195,8 +247,7 @@ O SOC-D alinha-se directamente com os objectivos NGI:
 
 ## 10. Contacto
 
-[Preencher com dados reais antes de submeter]
-
-Email: [email]
-GitHub: [user]
+Email: ribeiroleal574@gmail.com
+Contacto: 9817252
+GitHub: ribeiroleal574-droid
 País: Portugal
