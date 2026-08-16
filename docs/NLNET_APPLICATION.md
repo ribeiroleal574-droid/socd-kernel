@@ -250,4 +250,4 @@ isto com transparência.
 Email: ribeiroleal574@gmail.com
 Contacto: 9817252
 GitHub: ribeiroleal574-droid
-País: Portugal
+País: São Tomé e Príncipe
