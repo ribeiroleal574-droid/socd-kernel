@@ -274,3 +274,16 @@ pub fn get_known_peers() -> Vec<[u8; 32]> {
 pub fn lookup(node_id: &[u8; 32]) -> Option<PeerInfo> {
     PEER_TABLE.lock().lookup(node_id)
 }
+
+/// Regista/actualiza um peer descoberto na rede real (usado pela
+/// descoberta mDNS — ver p2p::discovery)
+pub fn add_discovered(
+    node_id: [u8; 32],
+    public_key: [u8; 32],
+    name: &str,
+    address: &str,
+    port: u16,
+    is_own: bool,
+) {
+    PEER_TABLE.lock().add_discovered(node_id, public_key, name, address, port, is_own);
+}

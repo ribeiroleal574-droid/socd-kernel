@@ -143,37 +143,11 @@ pub fn send(dst: [u8; 32], payload: Vec<u8>) -> u64 {
     TRANSPORT.lock().send(dst, payload)
 }
 
-/// Drena os frames recebidos pelo driver virtio-net (poll, sem
-/// bloquear) e entrega ao rx_queue os que forem pacotes P2P válidos
-/// (UDP, porta P2P_UDP_PORT, com pelo menos 32 bytes de node_id).
-/// Chamado periodicamente a partir do timer (ver arch::interrupts).
-pub fn poll_receive() {
-    let frames = crate::net::virtio_real::receive();
-    if frames.is_empty() { return; }
-
-    let mut delivered: Vec<([u8; 32], Vec<u8>)> = Vec::new();
-
-    for raw in frames {
-        let Some(eth) = EthernetFrame::parse(&raw) else { continue };
-        if eth.ethertype != ETH_TYPE_IPV4 { continue; }
-        let Some(ip) = Ipv4Packet::parse(&eth.payload) else { continue };
-        if ip.protocol != IP_PROTO_UDP { continue; }
-        let Some(udp) = UdpPacket::parse(&ip.payload) else { continue };
-        if udp.dst_port != P2P_UDP_PORT { continue; }
-        if udp.payload.len() < 32 { continue; }
-
-        let mut src_node = [0u8; 32];
-        src_node.copy_from_slice(&udp.payload[..32]);
-        let payload = udp.payload[32..].to_vec();
-        delivered.push((src_node, payload));
-    }
-
-    if !delivered.is_empty() {
-        let mut t = TRANSPORT.lock();
-        for (src, payload) in delivered {
-            t.on_received(src, payload);
-        }
-    }
+/// Regista um pacote genuinamente recebido da rede (chamado pelo
+/// dispatcher central — ver net::poll_and_dispatch — que faz o
+/// parsing real dos frames do driver e distribui por porta UDP).
+pub fn handle_udp(src_node: [u8; 32], payload: Vec<u8>) {
+    TRANSPORT.lock().on_received(src_node, payload);
 }
 
 pub fn get_stats() -> (u64, u64, u64, u64) {

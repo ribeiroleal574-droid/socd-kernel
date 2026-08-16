@@ -271,7 +271,10 @@ fn kernel_loop() -> ! {
                 ui::shell::tick(real_tick);
             }
             if real_tick % 20 == 0 {
-                p2p::transport::poll_receive();
+                // Ponto único de sondagem/distribuição da rede real —
+                // ver net::poll_and_dispatch (não pode haver mais do
+                // que um sítio a drenar virtio_real::receive()).
+                net::poll_and_dispatch();
             }
         }
 

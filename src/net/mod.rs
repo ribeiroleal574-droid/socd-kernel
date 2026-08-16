@@ -42,6 +42,51 @@ pub mod socket;    // Socket API
 pub mod dhcp;      // DHCP client
 pub mod dns;       // DNS resolver
 
+/// Dispatcher central de pacotes recebidos: chamado UMA vez por
+/// iteração do loop principal do kernel (contexto de tarefa normal,
+/// nunca de dentro da interrupção do timer — ver arch::interrupts e
+/// as notas sobre a classe de deadlock corrigida nessa fase).
+///
+/// Drena a fila de receção do virtio-net UMA única vez e distribui
+/// cada datagrama UDP pelo subsistema certo, consoante a porta de
+/// destino. Tem de ser um único ponto de dispatch: se cada subsistema
+/// (P2P transport, descoberta mDNS, ...) sondasse a rede
+/// independentemente, o primeiro a chamar `virtio_real::receive()`
+/// drenava a fila toda e os outros nunca viam os seus próprios
+/// pacotes.
+pub fn poll_and_dispatch() {
+    let frames = virtio_real::receive();
+    if frames.is_empty() { return; }
+
+    for raw in frames {
+        let Some(eth) = ethernet::EthernetFrame::parse(&raw) else { continue };
+        if eth.ethertype != ethernet::ETH_TYPE_IPV4 { continue; }
+        let Some(ip) = ethernet::Ipv4Packet::parse(&eth.payload) else { continue };
+
+        if ip.protocol == ethernet::IP_PROTO_UDP {
+            let Some(udp) = ethernet::UdpPacket::parse(&ip.payload) else { continue };
+
+            if udp.dst_port == crate::p2p::discovery::MDNS_PORT {
+                crate::p2p::discovery::handle_udp(&udp.payload, ip.src, udp.src_port);
+            } else if udp.dst_port == crate::p2p::transport::P2P_UDP_PORT {
+                if udp.payload.len() >= 32 {
+                    let mut src_node = [0u8; 32];
+                    src_node.copy_from_slice(&udp.payload[..32]);
+                    let payload = udp.payload[32..].to_vec();
+                    crate::p2p::transport::handle_udp(src_node, payload);
+                }
+            } else {
+                // Socket UDP genérico (ver net::ethernet::socket_*)
+                ethernet::dispatch_udp(ip.src, &udp);
+            }
+        } else if ip.protocol == ethernet::IP_PROTO_TCP {
+            if let Some(seg) = ethernet::TcpSegment::parse(&ip.payload) {
+                ethernet::dispatch_tcp(ip.src, &seg);
+            }
+        }
+    }
+}
+
 use alloc::{string::String, vec::Vec};
 use spinning_top::Spinlock;
 

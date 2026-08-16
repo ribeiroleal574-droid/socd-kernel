@@ -247,6 +247,13 @@ impl TcpSegment {
             checksum: 0, urgent_ptr: 0, payload: Vec::new(),
         }
     }
+    pub fn syn_ack(src: u16, dst: u16, seq: u32, ack: u32) -> Self {
+        Self {
+            src_port: src, dst_port: dst, seq_num: seq, ack_num: ack,
+            data_offset: 5, flags: TCP_SYN | TCP_ACK, window: 65535,
+            checksum: 0, urgent_ptr: 0, payload: Vec::new(),
+        }
+    }
     pub fn ack(src: u16, dst: u16, seq: u32, ack: u32, data: Vec<u8>) -> Self {
         Self {
             src_port: src, dst_port: dst, seq_num: seq, ack_num: ack,
@@ -254,7 +261,24 @@ impl TcpSegment {
             window: 65535, checksum: 0, urgent_ptr: 0, payload: data,
         }
     }
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn fin_ack(src: u16, dst: u16, seq: u32, ack: u32) -> Self {
+        Self {
+            src_port: src, dst_port: dst, seq_num: seq, ack_num: ack,
+            data_offset: 5, flags: TCP_FIN | TCP_ACK, window: 65535,
+            checksum: 0, urgent_ptr: 0, payload: Vec::new(),
+        }
+    }
+    pub fn rst(src: u16, dst: u16, seq: u32) -> Self {
+        Self {
+            src_port: src, dst_port: dst, seq_num: seq, ack_num: 0,
+            data_offset: 5, flags: TCP_RST, window: 0,
+            checksum: 0, urgent_ptr: 0, payload: Vec::new(),
+        }
+    }
+
+    /// Serializa sem checksum (todos os bytes de checksum a 0) — usar
+    /// só para cálculo interno do próprio checksum.
+    fn serialize_raw(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(20 + self.payload.len());
         buf.push((self.src_port >> 8) as u8); buf.push(self.src_port as u8);
         buf.push((self.dst_port >> 8) as u8); buf.push(self.dst_port as u8);
@@ -263,10 +287,50 @@ impl TcpSegment {
         buf.push(self.data_offset << 4);
         buf.push(self.flags);
         buf.push((self.window >> 8) as u8); buf.push(self.window as u8);
-        buf.push(0); buf.push(0); // checksum
+        buf.push(0); buf.push(0); // checksum (preenchido depois)
         buf.push(0); buf.push(0); // urgent
         buf.extend_from_slice(&self.payload);
         buf
+    }
+
+    /// Serializa com o checksum TCP real, calculado sobre o
+    /// pseudo-cabeçalho IPv4 (RFC 793 §3.1) — obrigatório para o
+    /// segmento não ser descartado por qualquer stack TCP real (ao
+    /// contrário do UDP, onde checksum=0 é uma opção válida).
+    pub fn serialize(&self, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> Vec<u8> {
+        let mut buf = self.serialize_raw();
+
+        let mut pseudo = Vec::with_capacity(12 + buf.len());
+        pseudo.extend_from_slice(&src_ip.0);
+        pseudo.extend_from_slice(&dst_ip.0);
+        pseudo.push(0);
+        pseudo.push(6); // protocolo TCP
+        pseudo.extend_from_slice(&(buf.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(&buf);
+
+        let checksum = internet_checksum(&pseudo);
+        buf[16] = (checksum >> 8) as u8;
+        buf[17] = checksum as u8;
+        buf
+    }
+
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 20 { return None; }
+        let data_offset = data[12] >> 4;
+        let header_len = (data_offset as usize) * 4;
+        if header_len < 20 || data.len() < header_len { return None; }
+        Some(Self {
+            src_port: u16::from_be_bytes([data[0], data[1]]),
+            dst_port: u16::from_be_bytes([data[2], data[3]]),
+            seq_num: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+            ack_num: u32::from_be_bytes([data[8], data[9], data[10], data[11]]),
+            data_offset,
+            flags: data[13],
+            window: u16::from_be_bytes([data[14], data[15]]),
+            checksum: u16::from_be_bytes([data[16], data[17]]),
+            urgent_ptr: u16::from_be_bytes([data[18], data[19]]),
+            payload: data[header_len..].to_vec(),
+        })
     }
 }
 
@@ -296,6 +360,11 @@ pub struct Socket {
     pub rx_buf:   Vec<u8>,
     pub tx_buf:   Vec<u8>,
     pub nonblock: bool,
+    /// Próximo número de sequência NOSSO a usar (só TCP)
+    pub seq_num:  u32,
+    /// Último número de sequência do peer que já vimos (para ACKs) —
+    /// na prática, o próximo byte que esperamos receber (só TCP)
+    pub ack_num:  u32,
 }
 
 impl Socket {
@@ -306,16 +375,20 @@ impl Socket {
             state: TcpState::Closed,
             rx_buf: Vec::new(), tx_buf: Vec::new(),
             nonblock: false,
+            seq_num: 0x1000_0000, // ISN inicial arbitrário (não aleatório — simplificação)
+            ack_num: 0,
         }
     }
 }
 
 pub struct SocketTable {
     sockets: BTreeMap<SocketFd, Socket>,
+    /// Próxima porta efémera a atribuir em bind()/connect() automático
+    next_ephemeral_port: u16,
 }
 
 impl SocketTable {
-    const fn new() -> Self { Self { sockets: BTreeMap::new() } }
+    const fn new() -> Self { Self { sockets: BTreeMap::new(), next_ephemeral_port: 49152 } }
 
     pub fn create(&mut self, kind: SocketKind) -> SocketFd {
         let sock = Socket::new(kind);
@@ -324,27 +397,37 @@ impl SocketTable {
         fd
     }
 
-    pub fn connect(&mut self, fd: SocketFd, addr: SocketAddr) -> bool {
-        if let Some(sock) = self.sockets.get_mut(&fd) {
-            sock.remote = Some(addr);
-            sock.state  = TcpState::SynSent;
-            // Fase 5: enviar SYN via virtio-net
-            sock.state  = TcpState::Established; // Simulado
-            crate::serial_println!("[NET][SOCK] fd={} conectado a {:?}", fd, addr);
-            return true;
-        }
-        false
+    fn alloc_ephemeral_port(&mut self) -> u16 {
+        let p = self.next_ephemeral_port;
+        self.next_ephemeral_port = if p >= 65000 { 49152 } else { p + 1 };
+        p
     }
 
-    pub fn send(&mut self, fd: SocketFd, data: &[u8]) -> usize {
+    /// Associa o socket a uma porta local específica (necessário para
+    /// receber dados — sem bind, um socket UDP/TCP não tem porta
+    /// local até `connect()` lhe atribuir uma efémera automaticamente)
+    pub fn bind(&mut self, fd: SocketFd, addr: SocketAddr) -> bool {
         if let Some(sock) = self.sockets.get_mut(&fd) {
-            if sock.state == TcpState::Established {
-                sock.tx_buf.extend_from_slice(data);
-                // Fase 5: flushear para virtio-net imediatamente
-                return data.len();
-            }
+            sock.local = Some(addr);
+            true
+        } else {
+            false
         }
-        0
+    }
+
+    /// Procura o socket dono de um segmento/datagrama recebido — por
+    /// (porta local, [porta+IP remoto para TCP, já ligado]).
+    fn find_owner(&mut self, local_port: u16, remote: SocketAddr) -> Option<&mut Socket> {
+        self.sockets.values_mut().find(|s| {
+            let local_matches = s.local.map(|l| l.port()) == Some(local_port);
+            if !local_matches { return false; }
+            match s.kind {
+                // TCP cliente: já sabemos com quem falamos — tem de bater certo
+                SocketKind::TcpClient => s.remote == Some(remote) || s.remote.is_none(),
+                // UDP/Raw: qualquer remetente na porta certa serve
+                _ => true,
+            }
+        })
     }
 
     pub fn recv(&mut self, fd: SocketFd, buf: &mut [u8]) -> usize {
@@ -356,16 +439,27 @@ impl SocketTable {
         }
         0
     }
-
-    pub fn close(&mut self, fd: SocketFd) {
-        if let Some(sock) = self.sockets.get_mut(&fd) {
-            sock.state = TcpState::Closed;
-        }
-        self.sockets.remove(&fd);
-    }
 }
 
 static SOCKET_TABLE: Spinlock<SocketTable> = Spinlock::new(SocketTable::new());
+
+/// Timeout (em ticks do timer, ~1ms cada) para operações bloqueantes
+/// de rede — handshake TCP, espera por ACK, fecho. Evita esperar para
+/// sempre por uma resposta que nunca chega (peer em baixo, sem rede).
+const NET_TIMEOUT_TICKS: u64 = 5000; // ~5s
+
+/// Espera (cedendo a CPU a outras tarefas, nunca busy-loop puro) até
+/// `cond` devolver `Some`, ou até passar `NET_TIMEOUT_TICKS`. Nunca
+/// segura nenhum lock durante a espera — quem chamar `cond` tem de
+/// bloquear/libertar o SOCKET_TABLE sozinho a cada tentativa.
+fn wait_for<T>(mut cond: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = crate::arch::interrupts::current_tick() + NET_TIMEOUT_TICKS;
+    loop {
+        if let Some(v) = cond() { return Some(v); }
+        if crate::arch::interrupts::current_tick() >= deadline { return None; }
+        crate::modules::scheduler::yield_now();
+    }
+}
 
 pub fn socket_create(proto: Protocol) -> SocketFd {
     let kind = match proto {
@@ -375,17 +469,229 @@ pub fn socket_create(proto: Protocol) -> SocketFd {
     };
     SOCKET_TABLE.lock().create(kind)
 }
+
+pub fn socket_bind(fd: SocketFd, addr: SocketAddr) -> bool {
+    SOCKET_TABLE.lock().bind(fd, addr)
+}
+
+/// Liga o socket a um destino. UDP: só regista o destino por omissão
+/// (sem pacotes na rede — semântica normal de connect() em UDP). TCP:
+/// faz o handshake de 3 vias real (SYN → SYN-ACK → ACK), bloqueando
+/// até NET_TIMEOUT_TICKS.
 pub fn socket_connect(fd: SocketFd, addr: SocketAddr) -> bool {
-    SOCKET_TABLE.lock().connect(fd, addr)
+    let SocketAddr::V4(dst_ip, dst_port) = addr else { return false; };
+    let Some(src_ip) = crate::net::get_primary_ip() else { return false; };
+
+    let (kind, local_port, isn) = {
+        let mut t = SOCKET_TABLE.lock();
+        if !t.sockets.contains_key(&fd) { return false; }
+        let needs_port = t.sockets.get(&fd).map(|s| s.local.is_none()).unwrap_or(false);
+        if needs_port {
+            let port = t.alloc_ephemeral_port();
+            if let Some(s) = t.sockets.get_mut(&fd) {
+                s.local = Some(SocketAddr::V4(src_ip, port));
+            }
+        }
+        let Some(sock) = t.sockets.get_mut(&fd) else { return false; };
+        sock.remote = Some(addr);
+        (sock.kind.clone(), sock.local.unwrap().port(), sock.seq_num)
+    };
+
+    if !matches!(kind, SocketKind::TcpClient) {
+        // UDP: liga sem tocar na rede
+        SOCKET_TABLE.lock().sockets.get_mut(&fd).map(|s| s.state = TcpState::Established);
+        return true;
+    }
+
+    // TCP: handshake real
+    SOCKET_TABLE.lock().sockets.get_mut(&fd).map(|s| s.state = TcpState::SynSent);
+    let dst_mac = crate::net::ethernet::arp_lookup(&dst_ip).unwrap_or(MacAddr::BROADCAST);
+    let syn = TcpSegment::syn(local_port, dst_port, isn);
+    if !send_tcp(&syn, src_ip, dst_ip, dst_mac) {
+        crate::serial_println!("[NET][TCP] fd={} SYN falhou (sem rede?)", fd);
+        return false;
+    }
+
+    let established = wait_for(|| {
+        let t = SOCKET_TABLE.lock();
+        match t.sockets.get(&fd).map(|s| s.state.clone()) {
+            Some(TcpState::Established) => Some(()),
+            Some(TcpState::Closed) => Some(()), // RST recebido — sai da espera, connect falha
+            _ => None,
+        }
+    });
+
+    let ok = established.is_some()
+        && SOCKET_TABLE.lock().sockets.get(&fd).map(|s| s.state.clone()) == Some(TcpState::Established);
+
+    if ok {
+        crate::serial_println!("[NET][SOCK] fd={} conectado a {:?} (TCP handshake real)", fd, addr);
+    } else {
+        crate::serial_println!("[NET][TCP] fd={} handshake falhou/timeout", fd);
+    }
+    ok
 }
+
+/// Envia dados. UDP: um datagrama real por chamada. TCP: um segmento
+/// PSH+ACK real (sem retransmissão — ver nota de âmbito no topo do
+/// ficheiro); espera o ACK do peer até NET_TIMEOUT_TICKS.
 pub fn socket_send(fd: SocketFd, data: &[u8]) -> usize {
-    SOCKET_TABLE.lock().send(fd, data)
+    let Some(src_ip) = crate::net::get_primary_ip() else { return 0; };
+
+    let (kind, state, local, remote, seq, ack) = {
+        let t = SOCKET_TABLE.lock();
+        let Some(s) = t.sockets.get(&fd) else { return 0; };
+        (s.kind.clone(), s.state.clone(), s.local, s.remote, s.seq_num, s.ack_num)
+    };
+    let (Some(SocketAddr::V4(_, local_port)), Some(SocketAddr::V4(dst_ip, dst_port))) = (local, remote) else { return 0; };
+    let dst_mac = crate::net::ethernet::arp_lookup(&dst_ip).unwrap_or(MacAddr::BROADCAST);
+
+    match kind {
+        SocketKind::Udp => {
+            let udp = UdpPacket::new(local_port, dst_port, data.to_vec());
+            let ip = Ipv4Packet::new(src_ip, dst_ip, IP_PROTO_UDP, udp.serialize());
+            let frame = EthernetFrame::new(dst_mac, MacAddr(crate::net::virtio_real::mac()), ETH_TYPE_IPV4, ip.serialize());
+            if crate::net::virtio_real::transmit(frame.serialize()) { data.len() } else { 0 }
+        }
+        SocketKind::TcpClient if state == TcpState::Established => {
+            let seg = TcpSegment::ack(local_port, dst_port, seq, ack, data.to_vec());
+            if !send_tcp(&seg, src_ip, dst_ip, dst_mac) { return 0; }
+
+            let new_seq = seq.wrapping_add(data.len() as u32);
+            let acked = wait_for(|| {
+                let t = SOCKET_TABLE.lock();
+                t.sockets.get(&fd).and_then(|s| if s.seq_num == new_seq { Some(()) } else { None })
+            });
+
+            if acked.is_some() {
+                data.len()
+            } else {
+                // Sem confirmação — assume enviado mesmo assim (sem
+                // retransmissão nesta versão simplificada) e avança
+                // o nosso próprio seq para não bloquear indefinidamente.
+                if let Some(s) = SOCKET_TABLE.lock().sockets.get_mut(&fd) { s.seq_num = new_seq; }
+                data.len()
+            }
+        }
+        _ => 0,
+    }
 }
+
 pub fn socket_recv(fd: SocketFd, buf: &mut [u8]) -> usize {
     SOCKET_TABLE.lock().recv(fd, buf)
 }
+
+/// Fecha o socket. TCP: envia FIN+ACK real e espera brevemente pela
+/// confirmação do peer antes de libertar o socket (sem TIME_WAIT
+/// completo — simplificação aceite para esta fase).
 pub fn socket_close(fd: SocketFd) {
-    SOCKET_TABLE.lock().close(fd)
+    let info = {
+        let t = SOCKET_TABLE.lock();
+        t.sockets.get(&fd).map(|s| (s.kind.clone(), s.state.clone(), s.local, s.remote, s.seq_num, s.ack_num))
+    };
+
+    if let Some((SocketKind::TcpClient, TcpState::Established, Some(SocketAddr::V4(src_ip, local_port)), Some(SocketAddr::V4(dst_ip, dst_port)), seq, ack)) = info {
+        let dst_mac = crate::net::ethernet::arp_lookup(&dst_ip).unwrap_or(MacAddr::BROADCAST);
+        let fin = TcpSegment::fin_ack(local_port, dst_port, seq, ack);
+        send_tcp(&fin, src_ip, dst_ip, dst_mac);
+        if let Some(s) = SOCKET_TABLE.lock().sockets.get_mut(&fd) { s.state = TcpState::FinWait1; }
+        // Espera breve por ACK/FIN do peer — não bloqueia o fecho se não vier.
+        let _ = wait_for(|| {
+            let t = SOCKET_TABLE.lock();
+            match t.sockets.get(&fd).map(|s| s.state.clone()) {
+                Some(TcpState::Closed) | Some(TcpState::TimeWait) => Some(()),
+                _ => None,
+            }
+        });
+    }
+
+    let mut t = SOCKET_TABLE.lock();
+    if let Some(sock) = t.sockets.get_mut(&fd) { sock.state = TcpState::Closed; }
+    t.sockets.remove(&fd);
+}
+
+/// Transmite um segmento TCP com checksum real
+fn send_tcp(seg: &TcpSegment, src_ip: Ipv4Addr, dst_ip: Ipv4Addr, dst_mac: MacAddr) -> bool {
+    let ip = Ipv4Packet::new(src_ip, dst_ip, IP_PROTO_TCP, seg.serialize(src_ip, dst_ip));
+    let src_mac = MacAddr(crate::net::virtio_real::mac());
+    let frame = EthernetFrame::new(dst_mac, src_mac, ETH_TYPE_IPV4, ip.serialize());
+    crate::net::virtio_real::transmit(frame.serialize())
+}
+
+/// Entrega um segmento TCP recebido ao socket dono (avança o
+/// handshake, entrega dados, trata FIN). Chamado pelo dispatcher
+/// central — ver net::poll_and_dispatch.
+///
+/// Estrutura em dois passos para nunca segurar o lock do
+/// SOCKET_TABLE enquanto se envia um pacote na rede: primeiro
+/// extraem-se os dados necessários e decide-se a resposta (com o
+/// lock), depois larga-se o lock e só então se transmite.
+pub fn dispatch_tcp(src_ip: Ipv4Addr, seg: &TcpSegment) {
+    // (porta_local, porta_dst, seq, ack) do ACK/resposta a enviar, se alguma
+    let mut reply: Option<(u16, u16, u32, u32)> = None;
+
+    {
+        let mut t = SOCKET_TABLE.lock();
+        let remote = SocketAddr::V4(src_ip, seg.src_port);
+        let Some(sock) = t.find_owner(seg.dst_port, remote) else { return; };
+        if sock.remote.is_none() { sock.remote = Some(remote); }
+
+        if seg.flags & TCP_RST != 0 {
+            sock.state = TcpState::Closed;
+            return;
+        }
+
+        match &sock.state {
+            TcpState::SynSent if seg.flags & (TCP_SYN | TCP_ACK) == (TCP_SYN | TCP_ACK) => {
+                sock.ack_num = seg.seq_num.wrapping_add(1);
+                sock.seq_num = seg.ack_num;
+                sock.state = TcpState::Established;
+                reply = Some((seg.dst_port, seg.src_port, sock.seq_num, sock.ack_num));
+            }
+            TcpState::Established => {
+                if !seg.payload.is_empty() {
+                    sock.rx_buf.extend_from_slice(&seg.payload);
+                    sock.ack_num = seg.seq_num.wrapping_add(seg.payload.len() as u32);
+                }
+                if seg.flags & TCP_FIN != 0 {
+                    sock.ack_num = sock.ack_num.wrapping_add(1);
+                    sock.state = TcpState::CloseWait;
+                    reply = Some((seg.dst_port, seg.src_port, sock.seq_num, sock.ack_num));
+                } else if !seg.payload.is_empty() {
+                    reply = Some((seg.dst_port, seg.src_port, sock.seq_num, sock.ack_num));
+                }
+            }
+            TcpState::FinWait1 => {
+                if seg.flags & TCP_FIN != 0 {
+                    sock.state = TcpState::TimeWait;
+                } else if seg.flags & TCP_ACK != 0 {
+                    sock.state = TcpState::FinWait2;
+                }
+            }
+            TcpState::FinWait2 if seg.flags & TCP_FIN != 0 => {
+                sock.ack_num = seg.seq_num.wrapping_add(1);
+                sock.state = TcpState::Closed;
+                reply = Some((seg.dst_port, seg.src_port, sock.seq_num, sock.ack_num));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some((src_port, dst_port, seq, ack)) = reply {
+        let Some(my_ip) = crate::net::get_primary_ip() else { return; };
+        let dst_mac = arp_lookup(&src_ip).unwrap_or(MacAddr::BROADCAST);
+        send_tcp(&TcpSegment::ack(src_port, dst_port, seq, ack, Vec::new()), my_ip, src_ip, dst_mac);
+    }
+}
+
+/// Entrega um datagrama UDP recebido ao socket dono (se algum estiver
+/// vinculado a essa porta local). Chamado pelo dispatcher central.
+pub fn dispatch_udp(src_ip: Ipv4Addr, udp: &UdpPacket) {
+    let mut t = SOCKET_TABLE.lock();
+    let remote = SocketAddr::V4(src_ip, udp.src_port);
+    if let Some(sock) = t.find_owner(udp.dst_port, remote) {
+        sock.rx_buf.extend_from_slice(&udp.payload);
+    }
 }
 
 // ─── DHCP ────────────────────────────────────────────────────────────────────
